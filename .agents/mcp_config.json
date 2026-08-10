@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "spotify": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "D:/spotify-mcp",
+        "run",
+        "--env-file",
+        "D:/spotify-mcp/.env",
+        "spotify-mcp"
+      ]
+    }
+  }
+}
