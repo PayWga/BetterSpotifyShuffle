@@ -164,6 +164,12 @@ def repair_database():
     df = df.dropna(subset=['id'])
     if len(df) < initial_count:
         print(f"Dropped {initial_count - len(df)} tracks missing a Spotify ID.")
+    
+    strict_positive_features = ['tempo', 'danceability', 'energy']
+    for col in strict_positive_features:
+        if col in df.columns:
+            # Mask the impossible zeroes with PyTorch padding token
+            df.loc[df[col] == 0.0, col] = -1.0
         
     # 2. PYTORCH INDICATORS (Flagging unknowns)
     # Continuous features get flagged with -1.0
