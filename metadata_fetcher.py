@@ -5,7 +5,7 @@ import os
 from datetime import datetime, timezone
 
 class MetadataTracker:
-    def __init__(self, save_file="daemon_memory.json", creds_file="sensitive_info/spotify_credentials.json"):
+    def __init__(self, save_file="sensitive_info/daemon_memory.json", creds_file="sensitive_info/spotify_credentials.json"):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.save_file = os.path.join(base_dir, save_file)
         actual_creds_path = os.path.join(base_dir, creds_file)
