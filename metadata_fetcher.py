@@ -1,28 +1,38 @@
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.cache_handler import CacheFileHandler
 import json
 import os
 from datetime import datetime, timezone
 
 class MetadataTracker:
-    def __init__(self, save_file="daemon_memory.json", creds_file="sensitive_info/spotify_credentials.json"):
+    def __init__(self, save_file="daemon_memory.json", creds_file="sensitive_info/spotify_credentials.json", connect_to_spotify=False):
         base_dir = os.path.dirname(os.path.abspath(__file__))
         self.save_file = os.path.join(base_dir, save_file)
-        actual_creds_path = os.path.join(base_dir, creds_file)
-        self.memory = self._load_memory()
+        self.creds_path = os.path.join(base_dir, creds_file)
+        self.cache_path = os.path.join(base_dir, "sensitive_info", ".spotify_cache")
         
-        try:
-            with open(actual_creds_path, 'r') as f:
-                creds = json.load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"Missing credentials file at {actual_creds_path}. Check your sensitive_info folder.")
-            
-        self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-            client_id=creds["client_id"],
-            client_secret=creds["client_secret"],
-            redirect_uri=creds["redirect_uri"],
-            scope="user-library-read user-read-playback-state" 
-        ))
+        self.memory = self._load_memory()
+        self.sp = None
+
+        if connect_to_spotify:
+            self.authenticate()
+
+    def authenticate(self):
+            """Wakes up the Spotify connection only when needed."""
+            try:
+                with open(self.creds_path, 'r') as f:
+                    creds = json.load(f)
+            except FileNotFoundError:
+                raise FileNotFoundError(f"\nCRITICAL: Cannot find file at:\n{self.creds_path}\n")
+                
+            self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
+                client_id=creds["client_id"],
+                client_secret=creds["client_secret"],
+                redirect_uri=creds["redirect_uri"],
+                scope="user-library-read user-read-playback-state",
+                cache_handler=CacheFileHandler(cache_path=self.cache_path)
+            ))
 
     def _load_memory(self):
         """Loads the skip/play history from the hard drive."""
@@ -103,6 +113,6 @@ class MetadataTracker:
         return self.memory[track_id]
 
 
-tracker = MetadataTracker()
+#tracker = MetadataTracker()
 
-tracker.sync_library_dates()
+#tracker.sync_library_dates()
