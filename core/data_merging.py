@@ -6,8 +6,8 @@ from spotipy.oauth2 import SpotifyOAuth
 import time
 
 # --- Setup Paths ---
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-MASTER_DB = os.path.join(SCRIPT_DIR, "master_track_table.csv")
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+MASTER_DB = os.path.join(SCRIPT_DIR, "data/master_track_table.csv")
 BASE_DATASET = os.path.join(SCRIPT_DIR, "kaggle_track_table.csv")  
 HISTORY_DB = os.path.join(SCRIPT_DIR, "sensitive_info/spotify_listening_history.csv")
 
