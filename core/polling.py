@@ -9,7 +9,7 @@ import spotipy.exceptions
 
 SCOPE = 'user-read-playback-state user-read-currently-playing user-modify-playback-state playlist-read-private'
 CREDS_FILE = "sensitive_info/spotify_credentials.json"
-SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+SCRIPT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CSV_FILE = os.path.join(SCRIPT_DIR, "sensitive_info/spotify_listening_history.csv")
 CREDS_PATH = os.path.join(SCRIPT_DIR, CREDS_FILE)
 
