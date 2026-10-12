@@ -35,6 +35,7 @@ def fetch_audio_from_youtube(track_name, artist_name, output_filepath):
         '--extract-audio',
         '--audio-format', 'mp3',
         '--default-search', 'ytsearch',
+        '--extractor-args', 'youtube:player_client=android',  # Bypasses web JS runtime requirement
         '--output', f"{base_output}.%(ext)s",
         '--quiet',
         query
