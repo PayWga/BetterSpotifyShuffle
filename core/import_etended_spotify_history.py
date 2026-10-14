@@ -1,176 +1,679 @@
+
 import os
 import json
 import glob
+from pathlib import Path
+
 import pandas as pd
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+MASTER_TRACK_TABLE = PROJECT_ROOT / "data" / "master_track_table.csv"
+
+PRIVATE_DIR = PROJECT_ROOT / "sensitive_info"
+
+DAEMON_MEMORY_FILE = PRIVATE_DIR / "daemon_memory.json"
+
+TEMP_EXTENDED_CSV = PRIVATE_DIR / "extended_history_temp.csv"
+
+LIVE_LOGGED_CSV = PRIVATE_DIR / "spotify_listening_history.csv"
+
+UNZIPPED_SPOTIFY_FOLDER = PRIVATE_DIR / "history"
+
+DEFAULT_DURATION_MS = 210000
+
+SKIP_THRESHOLD = 0.15
+PLAY_THRESHOLD = 0.70
+
+EVENT_COLUMNS = [
+    "timestamp",
+    "track_id",
+    "track_name",
+    "artist_name",
+    "ms_played",
+    "duration_ms",
+    "completion_rate",
+    "reason_start",
+    "reason_end",
+    "event_type",
+    "is_play",
+    "is_ghost_skip",
+    "context_uri",
+    "context_type",
+    "event_source"
+]
+
+
+
 def build_duration_lookup(history_files, master_db_path):
-    """Indexes true track durations using master DB and JSON completions."""
+    """Build a track duration lookup from the master database and history."""
+
     duration_lookup = {}
+
     if os.path.exists(master_db_path):
-        try:
-            db_df = pd.read_csv(master_db_path, usecols=['track_id', 'duration_ms'], low_memory=False)
-            db_df = db_df.dropna().drop_duplicates(subset=['track_id'])
-            duration_lookup = dict(zip(db_df['track_id'], db_df['duration_ms'].astype(float)))
-        except Exception:
-            pass
+        db_df = pd.read_csv(
+            master_db_path,
+            usecols=["id", "duration_ms"],
+            low_memory=False
+        )
+
+        db_df["id"] = db_df["id"].astype("string")
+        db_df["duration_ms"] = pd.to_numeric(
+            db_df["duration_ms"],
+            errors="coerce"
+        )
+
+        db_df = db_df.dropna(subset=["id", "duration_ms"])
+        db_df = db_df[db_df["duration_ms"] > 0]
+        db_df = db_df.drop_duplicates(subset=["id"])
+
+        duration_lookup = dict(
+            zip(db_df["id"], db_df["duration_ms"])
+        )
+
+    # Use completed listening events as an approximate
+    # duration source only for tracks missing from the DB.
+    estimated_durations = {}
 
     for filepath in history_files:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-            for item in data:
-                uri = item.get('spotify_track_uri')
-                if not uri or not uri.startswith('spotify:track:'):
-                    continue
-                track_id = uri.split(':')[-1]
-                ms_played = item.get('ms_played', 0)
-                # If reason_end is 'trackdone', the ms_played is the track's true length
-                if item.get('reason_end', '') == 'trackdone' and ms_played > 0:
-                    if ms_played > duration_lookup.get(track_id, 0):
-                        duration_lookup[track_id] = float(ms_played)
+
+        for item in data:
+            uri = item.get("spotify_track_uri")
+
+            if not uri or not uri.startswith("spotify:track:"):
+                continue
+
+            track_id = uri.split(":")[-1]
+
+            if track_id in duration_lookup:
+                continue
+
+            ms_played = item.get("ms_played") or 0
+
+            if (
+                item.get("reason_end") == "trackdone"
+                and ms_played > 0
+            ):
+                estimated_durations.setdefault(
+                    track_id, []
+                ).append(ms_played)
+
+    for track_id, durations in estimated_durations.items():
+        duration_lookup[track_id] = float(
+            pd.Series(durations).median()
+        )
+
     return duration_lookup
 
-def process_extended_streaming_history(history_folder, master_db_path, output_csv, memory_file):
-    """Parses Spotify JSONs into a sequence-ready CSV."""
-    history_files = glob.glob(os.path.join(history_folder, "Streaming_History_Audio_*.json"))
-    if not history_files:
-        raise FileNotFoundError(f"No history JSONs found in {history_folder}")
 
-    duration_lookup = build_duration_lookup(history_files, master_db_path)
-    SKIP_THRESHOLD, PLAY_THRESHOLD, DEFAULT_DURATION_MS = 0.15, 0.70, 210000.0
-    parsed_records, lifetime_plays, lifetime_skips = [], {}, {}
+def classify_listening_event(
+    completion_rate,
+    reason_end,
+    skipped=False
+):
+    """Classify an event using completion and playback information."""
+
+    if reason_end == "trackdone" or completion_rate >= PLAY_THRESHOLD:
+        return "PLAY", 1, 0
+
+    confirmed_skip = (
+        skipped is True
+        or reason_end in ["fwdbtn", "backbtn"]
+    )
+
+    if confirmed_skip and completion_rate < SKIP_THRESHOLD:
+        return "GHOST_SKIP", 0, 1
+
+    return "NEUTRAL", 0, 0
+
+
+def process_extended_streaming_history(history_folder, master_db_path, output_csv):
+    """Convert Spotify Extended Streaming History into normalized events."""
+
+    history_files = sorted(
+        glob.glob(
+            os.path.join(
+                history_folder,
+                "Streaming_History_Audio_*.json"
+            )
+        )
+    )
+
+    if not history_files:
+        raise FileNotFoundError(
+            f"No Spotify history JSON files found in {history_folder}"
+        )
+
+    duration_lookup = build_duration_lookup(
+        history_files,
+        master_db_path
+    )
+
+    parsed_records = []
 
     for filepath in history_files:
-        with open(filepath, 'r', encoding='utf-8') as f:
+        with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
+
         for row in data:
-            uri = row.get('spotify_track_uri')
-            if not uri or not uri.startswith('spotify:track:'):
+            uri = row.get("spotify_track_uri")
+
+            if not uri or not uri.startswith("spotify:track:"):
                 continue
-                
-            track_id = uri.split(':')[-1]
-            ms_played = row.get('ms_played', 0)
-            reason_end = row.get('reason_end', '')
-            skipped = row.get('skipped', False)
-            
-            total_duration = duration_lookup.get(track_id, DEFAULT_DURATION_MS)
-            percent_completed = ms_played / max(total_duration, 1.0)
 
-            is_play, is_ghost_skip, event_type = False, False, 'NEUTRAL'
+            track_id = uri.split(":")[-1]
 
-            if reason_end == 'trackdone' or percent_completed >= PLAY_THRESHOLD:
-                is_play, event_type = True, 'PLAY'
-                lifetime_plays[track_id] = lifetime_plays.get(track_id, 0) + 1
-            elif (skipped or reason_end in ['fwdbtn', 'backbtn', 'endplay']) and percent_completed < SKIP_THRESHOLD:
-                is_ghost_skip, event_type = True, 'GHOST_SKIP'
-                lifetime_skips[track_id] = lifetime_skips.get(track_id, 0) + 1
+            timestamp = row.get("ts")
+            if not timestamp:
+                continue
+
+            ms_played = max(
+                0, int(row.get("ms_played") or 0)
+            )
+
+            duration_ms = duration_lookup.get(
+                track_id,
+                DEFAULT_DURATION_MS
+            )
+
+            completion_rate = min(
+                ms_played / max(duration_ms, 1),
+                1.0
+            )
+
+            reason_end = row.get("reason_end") or ""
+            reason_start = row.get("reason_start") or ""
+            skipped = row.get("skipped", False)
+
+            event_type, is_play, is_ghost_skip = (
+                classify_listening_event(
+                    completion_rate,
+                    reason_end,
+                    skipped
+                )
+            )
 
             parsed_records.append({
-                'timestamp': row.get('ts'),
-                'track_id': track_id,
-                'track_name': row.get('master_metadata_track_name'),
-                'artist_name': row.get('master_metadata_album_artist_name'),
-                'ms_played': ms_played,
-                'duration_ms': total_duration,
-                'percent_completed': round(percent_completed, 4),
-                'reason_start': row.get('reason_start'),
-                'reason_end': reason_end,
-                'event_type': event_type,
-                'is_play': int(is_play),
-                'is_ghost_skip': int(is_ghost_skip)
+                "timestamp": timestamp,
+                "track_id": track_id,
+
+                "track_name": row.get(
+                    "master_metadata_track_name"
+                ),
+
+                "artist_name": row.get(
+                    "master_metadata_album_artist_name"
+                ),
+
+                "ms_played": ms_played,
+                "duration_ms": duration_ms,
+                "completion_rate": round(completion_rate, 4),
+
+                "reason_start": reason_start,
+                "reason_end": reason_end,
+
+                "event_type": event_type,
+                "is_play": is_play,
+                "is_ghost_skip": is_ghost_skip,
+
+                "context_uri": None,
+                "context_type": None,
+
+                "event_source": "extended_history",
+
+                # Preserve useful Spotify history fields
+                "shuffle": row.get("shuffle"),
+                "skipped": skipped,
+                "offline": row.get("offline"),
+                "platform": row.get("platform"),
+                "incognito_mode": row.get("incognito_mode")
             })
 
     df = pd.DataFrame(parsed_records)
-    # Ensure UTC timezone alignment for safe deduplication later
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
-    df = df.sort_values('timestamp').reset_index(drop=True)
-    os.makedirs(os.path.dirname(output_csv), exist_ok=True)
-    df.to_csv(output_csv, index=False)
-    print(f"Processed {len(df)} historical streams. Saved to {output_csv}.")
 
-    # Apply historical skips and plays to the live daemon memory JSON
-    if os.path.exists(memory_file):
-        with open(memory_file, 'r') as f:
-            memory = json.load(f)
-        for t_id, count in lifetime_plays.items():
-            memory.setdefault(t_id, {'play_count': 0, 'skip_count': 0, 'days_since_added': 365})['play_count'] += count
-        for t_id, count in lifetime_skips.items():
-            memory.setdefault(t_id, {'play_count': 0, 'skip_count': 0, 'days_since_added': 365})['skip_count'] += count
-        with open(memory_file, 'w') as f:
-            json.dump(memory, f, indent=4)
-        print("Live Daemon memory updated with lifetime interaction counts.")
-            
+    if df.empty:
+        raise ValueError("No valid track events found in history.")
+
+    # Extended Spotify history timestamps are UTC.
+    df["timestamp"] = pd.to_datetime(
+        df["timestamp"],
+        utc=True,
+        errors="coerce"
+    )
+
+    df = df.dropna(subset=["timestamp"])
+
+    df = df.sort_values(
+        "timestamp",
+        kind="stable"
+    ).reset_index(drop=True)
+
+    # Preserve timezone information in an explicit ISO format.
+    df["timestamp"] = df["timestamp"].dt.strftime(
+        "%Y-%m-%dT%H:%M:%S.%fZ"
+    )
+
+    output_csv = Path(output_csv)
+    output_csv.parent.mkdir(parents=True, exist_ok=True)
+
+    df.to_csv(output_csv, index=False)
+
+    print(
+        f"Processed {len(df)} historical listening events. "
+        f"Saved to {output_csv}."
+    )
+
     return output_csv
 
-def combine_and_deduplicate(extended_csv, logged_csv, output_csv):
-    print("Loading historical datasets...")
-    
+
+def normalize_listening_history(df, source):
+    """Normalize historical and live listening records."""
+
+    df = df.copy()
+
+    # Rename columns from the original polling format.
+    df = df.rename(columns={
+        "listened_ms": "ms_played",
+        "artist": "artist_name",
+        "percent_completed": "completion_rate"
+    })
+
+    if "completion_rate" not in df.columns:
+        df["completion_rate"] = float("nan")
+
+    if "ms_played" not in df.columns:
+        df["ms_played"] = 0
+
+    if "duration_ms" not in df.columns:
+        df["duration_ms"] = float("nan")
+
+    df["ms_played"] = pd.to_numeric(
+        df["ms_played"], errors="coerce"
+    ).fillna(0)
+
+    df["duration_ms"] = pd.to_numeric(
+        df["duration_ms"], errors="coerce"
+    )
+
+    df["completion_rate"] = pd.to_numeric(
+        df["completion_rate"], errors="coerce"
+    )
+
+    missing_completion = df["completion_rate"].isna()
+
+    valid_duration = df["duration_ms"] > 0
+
+    can_calculate = missing_completion & valid_duration
+
+    df.loc[can_calculate, "completion_rate"] = (
+        df.loc[can_calculate, "ms_played"]
+        / df.loc[can_calculate, "duration_ms"]
+    ).clip(0, 1)
+
+    # Preserve original event source when already present.
+    if "event_source" not in df.columns:
+        df["event_source"] = source
+    else:
+        df["event_source"] = df["event_source"].fillna(source)
+
+    for col in [
+        "reason_start", "reason_end",
+        "context_uri", "context_type",
+        "track_name", "artist_name"
+    ]:
+        if col not in df.columns:
+            df[col] = None
+
+    for col in ["event_type", "is_play", "is_ghost_skip"]:
+        if col not in df.columns:
+            df[col] = None
+
+    # Classify records that do not already have labels.
+    missing_labels = df["event_type"].isna()
+
+    for idx in df.index[missing_labels]:
+        completion = df.at[idx, "completion_rate"]
+
+        if pd.isna(completion):
+            continue
+
+        reason_end = df.at[idx, "reason_end"]
+        skipped = (
+            df.at[idx, "skipped"]
+            if "skipped" in df.columns
+            else False
+        )
+
+        # Live polling may not have explicit skip reasons.
+        # An early ending is only an inferred negative signal.
+        if source == "live_polling" and pd.isna(reason_end):
+            if completion >= PLAY_THRESHOLD:
+                labels = ("PLAY", 1, 0)
+            elif completion < SKIP_THRESHOLD:
+                labels = ("GHOST_SKIP", 0, 1)
+            else:
+                labels = ("NEUTRAL", 0, 0)
+        else:
+            labels = classify_listening_event(
+                completion,
+                reason_end or "",
+                skipped
+            )
+
+        df.at[idx, "event_type"] = labels[0]
+        df.at[idx, "is_play"] = labels[1]
+        df.at[idx, "is_ghost_skip"] = labels[2]
+
+    return df
+
+
+def normalize_timestamps(df, legacy_timezone=None):
+    """Convert timestamps to timezone-aware UTC datetimes."""
+
+    df = df.copy()
+
+    def parse_timestamp(value, source):
+        if pd.isna(value):
+            return pd.NaT
+
+        ts = pd.Timestamp(value)
+
+        if ts.tzinfo is not None:
+            return ts.tz_convert("UTC")
+
+        if source == "live_polling":
+            if legacy_timezone is None:
+                raise ValueError(
+                    "Legacy live timestamps need an explicit timezone."
+                )
+
+            return ts.tz_localize(
+                legacy_timezone,
+                ambiguous="raise",
+                nonexistent="raise"
+            ).tz_convert("UTC")
+
+        # Older extended-history CSV exports were stored
+        # as timezone-naive UTC timestamps.
+        return ts.tz_localize("UTC")
+
+    df["timestamp"] = [
+        parse_timestamp(value, source)
+        for value, source in zip(
+            df["timestamp"],
+            df["event_source"]
+        )
+    ]
+
+    return df.dropna(subset=["timestamp"])
+
+
+def combine_and_deduplicate(extended_csv, logged_csv, output_csv, legacy_timezone=None):
+    """Merge listening histories and remove duplicate events."""
+
+    print("Loading historical listening datasets...")
+
     df_ext = pd.read_csv(extended_csv, low_memory=False)
     df_log = pd.read_csv(logged_csv, low_memory=False)
+
+    df_ext = normalize_listening_history(
+        df_ext,
+        source="extended_history"
+    )
+
+    df_log = normalize_listening_history(
+        df_log,
+        source="live_polling"
+    )
+
+    df_ext = normalize_timestamps(
+        df_ext,
+        legacy_timezone=legacy_timezone
+    )
+
+    df_log = normalize_timestamps(
+        df_log,
+        legacy_timezone=legacy_timezone
+    )
+
+    df_combined = pd.concat(
+        [df_ext, df_log],
+        ignore_index=True
+    )
+
+    # Preserve extended history when duplicate events overlap.
+    df_combined["_priority"] = (
+        df_combined["event_source"]
+        .map({
+            "extended_history": 0,
+            "live_polling": 1
+        })
+        .fillna(2)
+    )
+
+    df_combined = df_combined.sort_values(
+        ["_priority", "timestamp"],
+        kind="stable"
+    )
+
+    # Remove exact duplicate event timestamps and track IDs.
+    df_combined = df_combined.drop_duplicates(
+        subset=["track_id", "timestamp"],
+        keep="first"
+    )
+
+    # Identify cross-source overlaps conservatively.
+    # Compare live events against the imported historical events.
+    extended = df_combined[
+        df_combined["event_source"] == "extended_history"
+    ].sort_values("timestamp")
+
+    other = df_combined[
+        df_combined["event_source"] != "extended_history"
+    ].sort_values("timestamp")
+
     
-    # NORMALIZATION: Force both formats to parse, then round down to the nearest second
-    df_ext['timestamp'] = pd.to_datetime(df_ext['timestamp'], format='mixed', utc=True).dt.tz_localize(None).dt.floor('s')
-    df_log['timestamp'] = pd.to_datetime(df_log['timestamp'], format='mixed', utc=True).dt.tz_localize(None).dt.floor('s')
-    
-    df_combined = pd.concat([df_ext, df_log], ignore_index=True)
-    df_combined = df_combined.sort_values('timestamp').reset_index(drop=True)
-    
-    # SCHEMA ENFORCEMENT: Safely fill missing string columns
-    string_cols = ['episode_name', 'episode_show_name', 'reason_start', 'reason_end', 'track_name', 'artist_name']
-    existing_str_cols = [c for c in string_cols if c in df_combined.columns]
-    
-    if existing_str_cols:
-        df_combined[existing_str_cols] = df_combined[existing_str_cols].fillna("")
-    
-    # Safely force boolean columns to strict integers (0 or 1)
-    bool_cols = ['shuffle', 'skipped', 'offline', 'incognito_mode', 'is_play', 'is_ghost_skip']
-    for col in bool_cols:
-        if col in df_combined.columns:
-            df_combined[col] = df_combined[col].fillna(False).astype(int)
-    
-    # TIME-WINDOW DEDUPLICATION
-    df_combined['time_diff'] = df_combined.groupby('track_id')['timestamp'].diff()
-    is_duplicate = df_combined['time_diff'] < pd.Timedelta(seconds=60)
-    
-    df_clean = df_combined[~is_duplicate].drop(columns=['time_diff']).reset_index(drop=True)
-    
-    # FORMATTING: Convert the cleaned datetimes back into uniform strings
-    df_clean['timestamp'] = df_clean['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S')
-    
-    df_clean.to_csv(output_csv, index=False)
-    print(f"Removed {len(df_combined) - len(df_clean)} overlaps. Unified dataset size: {len(df_clean)} streams.")
+    if not extended.empty and not other.empty:
+        other = other.copy()
+        other["_row_id"] = range(len(other))
+
+        reference = extended[
+            ["track_id", "timestamp"]
+        ].rename(columns={
+            "timestamp": "matched_timestamp"
+        })
+
+        matched = pd.merge_asof(
+            other.sort_values("timestamp"),
+            reference.sort_values("matched_timestamp"),
+            left_on="timestamp",
+            right_on="matched_timestamp",
+            by="track_id",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=5)
+        )
+
+        unmatched_ids = set(
+            matched.loc[
+                matched["matched_timestamp"].isna(),
+                "_row_id"
+            ]
+        )
+
+        other = other[
+            other["_row_id"].isin(unmatched_ids)
+        ].drop(columns=["_row_id"])
+
+    for frame in (df_ext, df_log):
+        if "track_id" not in frame.columns:
+            raise ValueError("Listening data must contain 'track_id'.")
+
+        frame.dropna(subset=["track_id"], inplace=True)
+        frame["track_id"] = frame["track_id"].astype(str).str.strip()
+        frame.drop(
+            frame.index[frame["track_id"] == ""],
+            inplace=True
+        )
+
+    df_clean = pd.concat(
+        [extended, other],
+        ignore_index=True
+    )
+
+    df_clean = df_clean.sort_values(
+        "timestamp",
+        kind="stable"
+    ).reset_index(drop=True)
+
+    df_clean = df_clean.drop(columns=["_priority"])
+
+    df_clean["timestamp"] = (
+        df_clean["timestamp"]
+        .dt.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    )
+
+    output_csv = Path(output_csv)
+
+    temp_path = output_csv.with_suffix(".tmp.csv")
+
+    try:
+        df_clean.to_csv(temp_path, index=False)
+        os.replace(temp_path, output_csv)
+
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    print(
+        f"Removed {len(df_combined) - len(df_clean)} "
+        f"additional cross-source overlaps."
+    )
+    print(
+        f"Unified dataset contains {len(df_clean)} events."
+    )
+
+    return output_csv
+
+
+def rebuild_preference_counts(history_csv, memory_file):
+    """Recalculate play and skip counts from unified history."""
+
+    history = pd.read_csv(history_csv, low_memory=False)
+
+    required = ["track_id", "is_play", "is_ghost_skip"]
+    missing = [c for c in required if c not in history.columns]
+
+    if missing:
+        raise ValueError(f"Missing history columns: {missing}")
+
+    history = history.dropna(subset=["track_id"]).copy()
+    history["track_id"] = history["track_id"].astype(str).str.strip()
+    history = history[history["track_id"] != ""]
+
+    for col in ["is_play", "is_ghost_skip"]:
+        history[col] = pd.to_numeric(
+            history[col], errors="coerce"
+        ).fillna(0).astype(int)
+
+    aggregates = history.groupby("track_id").agg(
+        play_count=("is_play", "sum"),
+        skip_count=("is_ghost_skip", "sum")
+    )
+
+    memory_file = Path(memory_file)
+
+    if memory_file.exists():
+        with open(memory_file, "r", encoding="utf-8") as f:
+            memory = json.load(f)
+    else:
+        memory = {}
+
+    if not isinstance(memory, dict):
+        raise ValueError("Invalid daemon memory format.")
+
+    # Counts come from the unified listening history.
+    # Existing per-track metadata is preserved.
+    for record in memory.values():
+        record["play_count"] = 0
+        record["skip_count"] = 0
+
+    for track_id, row in aggregates.iterrows():
+        record = memory.setdefault(
+            track_id,
+            {
+                "play_count": 0,
+                "skip_count": 0,
+                "added_at": None
+            }
+        )
+
+        record["play_count"] = int(row["play_count"])
+        record["skip_count"] = int(row["skip_count"])
+
+    memory_file.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = memory_file.with_suffix(".tmp.json")
+
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(memory, f, indent=4)
+
+        os.replace(temp_path, memory_file)
+
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+    print("Preference counts rebuilt from unified history.")
+
 
 if __name__ == "__main__":
-    BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    
-    MASTER_TRACK_TABLE = os.path.join(BASE_DIR, "master_track_table.csv")
-    DAEMON_MEMORY_FILE = os.path.join(BASE_DIR, "sensitive_info","daemon_memory.json")
-    
-    TEMP_EXTENDED_CSV = os.path.join(BASE_DIR, "sensitive_info", "extended_history_temp.csv")
-    LIVE_LOGGED_CSV   = os.path.join(BASE_DIR, "sensitive_info", "spotify_listening_history.csv")
-    UNZIPPED_SPOTIFY_FOLDER = os.path.join(BASE_DIR, "sensitive_info", "history")
-    FINAL_UNIFIED_CSV = LIVE_LOGGED_CSV
+    import shutil
 
+    print("Step 1: Parsing Spotify Extended History...")
 
-    print("Step 1: Parsing Spotify Extended History JSONs...")
     process_extended_streaming_history(
         history_folder=UNZIPPED_SPOTIFY_FOLDER,
         master_db_path=MASTER_TRACK_TABLE,
-        output_csv=TEMP_EXTENDED_CSV,
-        memory_file=DAEMON_MEMORY_FILE
+        output_csv=TEMP_EXTENDED_CSV
     )
-    
-    print("\nStep 2: Recombining and Deduplicating into Live Log...")
-    if os.path.exists(LIVE_LOGGED_CSV):
+
+    # Preserve the existing listening history before modifying it.
+    if LIVE_LOGGED_CSV.exists():
+        backup_path = LIVE_LOGGED_CSV.with_suffix(".backup.csv")
+        shutil.copy2(LIVE_LOGGED_CSV, backup_path)
+
+        print(f"Backup saved to {backup_path}")
+
+        print("\nStep 2: Merging and deduplicating history...")
+
         combine_and_deduplicate(
             extended_csv=TEMP_EXTENDED_CSV,
             logged_csv=LIVE_LOGGED_CSV,
-            output_csv=FINAL_UNIFIED_CSV
+            output_csv=LIVE_LOGGED_CSV,
+
+            # Set this to the original polling machine's
+            # timezone for legacy timezone-naive live logs.
+            legacy_timezone=None
         )
+
     else:
-        print(f"No existing log found at {LIVE_LOGGED_CSV}. Promoting extended history to primary log.")
-        os.rename(TEMP_EXTENDED_CSV, FINAL_UNIFIED_CSV)
-        
-    if os.path.exists(TEMP_EXTENDED_CSV):
-        os.remove(TEMP_EXTENDED_CSV)
-        
-    print(f"\nSuccess. Unified history saved directly to: {LIVE_LOGGED_CSV}")
+        print("No existing live history found.")
+
+        os.replace(
+            TEMP_EXTENDED_CSV,
+            LIVE_LOGGED_CSV
+        )
+
+    if TEMP_EXTENDED_CSV.exists():
+        TEMP_EXTENDED_CSV.unlink()
+
+    print("\nStep 3: Rebuilding preference counts...")
+
+    rebuild_preference_counts(
+        history_csv=LIVE_LOGGED_CSV,
+        memory_file=DAEMON_MEMORY_FILE
+    )
+
+    print("\nHistory import completed successfully.")
