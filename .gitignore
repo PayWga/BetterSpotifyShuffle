@@ -20,6 +20,7 @@ build/
 .vscode/
 *.swp
 *.swo
+AGENTS.md
 
 # OS
 .DS_Store
@@ -31,3 +32,8 @@ venv/
 
 # Folders
 sensitive_info
+
+# Reproducible test artifacts and downloaded audio
+.pytest_cache/
+.test-runs/
+data/temp_audio/

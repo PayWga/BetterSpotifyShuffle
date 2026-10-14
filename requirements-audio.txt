@@ -1,0 +1,7 @@
+# FFmpeg (including ffprobe) must also be on PATH.
+# For full YouTube support, install Node.js >=22 or Deno >=2.3.
+numpy>=1.26,<3
+pandas>=2.2,<3
+librosa>=0.11,<2
+soundfile>=0.12,<1
+yt-dlp[default]>=2026.8.19
