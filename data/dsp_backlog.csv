@@ -1,33 +1,8 @@
 track_id,track_name,artist_name,attempts,last_error
-7eIHyaqwKZxbL5MmBDvGeh,Contradiction,Polygon,1,audio_not_found
-10ydLIh6TZhiafiLmxv1Ky,Xylitol,League of Legends,1,audio_not_found
-7284Lm1fMEABEFBrtMgUWR,No Sleep Leak,Lil Uzi Vert,1,audio_not_found
-7xeDETVgMCoPkHU3dXtN9x,Farewell,Eminem,1,audio_not_found
-7F5dzHiZ8EmD8szZtaDZsQ,So Bad,Eminem,1,audio_not_found
-33xM3SLxNLpZxbvxOzBbew,"You Gon’ Learn (feat. Royce Da 5'9"" & White Gold)",Eminem,1,audio_not_found
-7hiBhOh4s8G0xmGYBAjyuw,Beautiful Pain,Eminem,1,audio_not_found
-0iMN420Q45isZVNlAqzPTW,Love Game,Eminem,1,audio_not_found
-3CJbxqRQ0JNCqboWDNUUeX,"I Will (feat. KXNG Crooked, Royce Da 5'9"" & Joell Ortiz)",Eminem,1,audio_not_found
-6YxWzMtFrGETbAcvqbUiww,Cum On Everybody,Eminem,1,audio_not_found
-02oJPSOD543viMH6d5VZkM,Leaving Heaven (feat. Skylar Grey),Eminem,1,audio_not_found
-0EgkVzDidmq4MP57jZFeik,Paul Rosenberg - Skit,Eminem,1,audio_not_found
-0je6gk6ukXjHwzeybX6JLv,Greg - A Cappella,Eminem,1,audio_not_found
-6wrujrWK30hnVbpOJYbnQt,No Love,Eminem,1,audio_not_found
-6Xk7PnitV9jCRorWt2LiVZ,Berzerk,Eminem,1,audio_not_found
-3E1BkJEsRK7VsSNzijilGm,Evil Twin,Eminem,1,audio_not_found
-5mQNVUP0weaqUx4zJI2whE,My Name Is - Instrumental,Eminem,1,audio_not_found
-1cEUi8QulMj1xgrPwwGC2p,Tone Deaf,Eminem,1,audio_not_found
-2J3CYFUn6eAuHz5S9IKape,The Kiss - Skit,Eminem,1,audio_not_found
-1oHXeD1gQQCQUYHeHp2HMU,Discombobulated,Eminem,1,audio_not_found
-435kMcZJuXJJwKelsDjP4R,Thus Far - Interlude,Eminem,1,audio_not_found
-6B3zy3LOKHndqsviCr2z15,Em Calls Paul - Skit,Eminem,1,audio_not_found
-0uAkm1iQLrzweZ4U1iXy6w,Alfred’s Theme,Eminem,1,audio_not_found
-4g32MdRoqwGKQd3NXIRhpU,Good Guy (feat. Jessie Reyez),Eminem,1,audio_not_found
-4tME51EiaLJvxGZExXRdRX,Stan - Instrumental,Eminem,1,audio_not_found
-6s76kkSLgFVyAwKKaW7spV,Stepdad - Intro,Eminem,1,audio_not_found
-50le2HSqQAIqB4BGD4cE9e,Black Magic (feat. Skylar Grey),Eminem,1,audio_not_found
-5VqSAZujDWDJkQ11Laf9W1,Bad Meets Evil,Eminem,1,audio_not_found
-3zXGMmgIygV00eFxyqmbeO,Role Model,Eminem,1,audio_not_found
+10ydLIh6TZhiafiLmxv1Ky,Xylitol,League of Legends,3,download_failed: DownloadError
+0je6gk6ukXjHwzeybX6JLv,Greg - A Cappella,Eminem,2,audio_not_found
+50le2HSqQAIqB4BGD4cE9e,Black Magic (feat. Skylar Grey),Eminem,2,audio_not_found
+5VqSAZujDWDJkQ11Laf9W1,Bad Meets Evil,Eminem,2,download_failed: DownloadError
 5QD28FqaM3jTfsqWwvRZwv,Soldier,Eminem,1,audio_not_found
 58QhkbaAkLFnn7JwAnAato,Fall,Eminem,1,audio_not_found
 6v5THhwG0Of1H0tBnZ7kkw,Soap - Skit,Eminem,1,audio_not_found

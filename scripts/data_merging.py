@@ -1,6 +1,7 @@
 
 import argparse
 import os
+import tempfile
 import time
 from pathlib import Path
 
@@ -97,6 +98,59 @@ METADATA_COLUMNS = [
 ]
 
 
+# A measured -1 is impossible in these known nonnegative fields. For key,
+# Spotify's -1 means "no key detected", normalized to this project's NaN.
+# Loudness and local_rms_db are deliberately excluded: -1 dB can be real.
+# Unknown/custom columns and provenance are never interpreted as placeholders.
+PLACEHOLDER_COLUMNS = (
+    BOUNDED_FEATURES + ["tempo"] + DISCRETE_FEATURES
+    + NUMERICAL_FEATURES + BOOLEAN_FEATURES
+    + ["release_year", "local_onset_strength", "local_spectral_centroid",
+       "local_spectral_contrast", "local_beat_regularity"]
+)
+
+
+def clear_feature_placeholders(df):
+    """Return a copy with exact numeric -1 sentinels cleared, plus column counts.
+
+    Numeric conversion is only used for comparison; all other cells keep their
+    original values and representation. No range repair or row pruning occurs.
+    """
+    cleaned = df.copy()
+    counts = {}
+    for column in PLACEHOLDER_COLUMNS:
+        if column not in cleaned:
+            continue
+        missing = pd.to_numeric(cleaned[column], errors="coerce").eq(-1).fillna(False)
+        count = int(missing.sum())
+        if count:
+            cleaned[column] = cleaned[column].mask(missing)
+            counts[column] = count
+    return cleaned, counts
+
+
+def clear_placeholders(master_path=None, dry_run=False):
+    """Clear known -1 placeholders in a master CSV, or report a read-only preview.
+
+    Run only when other catalog writers (including extraction) have stopped.
+    Returns counts of changed cells per column; an unchanged file is not rewritten.
+    """
+    path = Path(MASTER_DB if master_path is None else master_path)
+    # Read text verbatim so labels like 0007 and names like NA survive the rewrite.
+    df = pd.read_csv(path, dtype="string", keep_default_na=False, low_memory=False)
+    if "id" not in df.columns:
+        raise ValueError("Master CSV must have an id column")
+    cleaned, counts = clear_feature_placeholders(df)
+    total = sum(counts.values())
+    if not dry_run and total:
+        save_database(cleaned, path=path)
+    action = "DRY RUN: would clear" if dry_run else "Cleared"
+    print(f"{action} {total} placeholder cells across {len(counts)} columns.")
+    for column, count in counts.items():
+        print(f"  {column}: {count}")
+    return counts
+
+
 
 def normalize_track_ids(df):
     """Normalize the track ID column to 'id'."""
@@ -138,7 +192,7 @@ def normalize_track_ids(df):
 def clean_track_features(df):
     """Clean numerical features while preserving valid values."""
 
-    df = df.copy()
+    df, _ = clear_feature_placeholders(df)
 
     audio_features = CONTINUOUS_FEATURES + DISCRETE_FEATURES
     numeric_columns = audio_features + NUMERICAL_FEATURES
@@ -149,11 +203,6 @@ def clean_track_features(df):
             continue
 
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # Convert legacy unknown indicators for audio
-        # features into NaN.
-        if col in audio_features:
-            df[col] = df[col].replace(-1, float("nan"))
 
     # Validate audio features bounded between 0 and 1
     for col in BOUNDED_FEATURES:
@@ -258,16 +307,19 @@ def merge_track_data(master_df, new_df):
     return combined_df.reset_index()
 
 
-def save_database(df):
+def save_database(df, path=None):
     """Write the master database using an atomic file replacement."""
 
-    MASTER_DB.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_path = MASTER_DB.with_suffix(".tmp.csv")
-
+    path = Path(MASTER_DB if path is None else path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".csv", dir=path.parent)
+    temp_path = Path(temp_name)
     try:
-        df.to_csv(temp_path, index=False)
-        os.replace(temp_path, MASTER_DB)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+            df.to_csv(output, index=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
 
     finally:
         if temp_path.exists():
@@ -496,12 +548,18 @@ def repair_database():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Spotify Offline Track Features Database Manager")
-    parser.add_argument("--init", action="store_true", help="Initialize the Master DB from the Kaggle dataset")
-    parser.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
-    parser.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
-    parser.add_argument("--repair", action="store_true", help="Format missing data for PyTorch <UNK> processing")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--init", action="store_true", help="Initialize the Master DB from the Kaggle dataset")
+    actions.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
+    actions.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
+    actions.add_argument("--repair", action="store_true", help="Clean identifiers, duplicates, and invalid feature values")
+    actions.add_argument("--clear-placeholders", action="store_true", help="Convert exact -1 sentinels in known nonnegative columns to NaN")
+    parser.add_argument("--master", type=Path, help="Master CSV for --clear-placeholders (defaults to the project catalog)")
+    parser.add_argument("--dry-run", action="store_true", help="Preview --clear-placeholders without writing")
     
     args = parser.parse_args()
+    if (args.master is not None or args.dry_run) and not args.clear_placeholders:
+        parser.error("--master and --dry-run require --clear-placeholders")
     
     if args.init:
         init_database()
@@ -511,9 +569,12 @@ if __name__ == "__main__":
         sync_metadata()
     elif args.repair:
         repair_database()
+    elif args.clear_placeholders:
+        clear_placeholders(args.master, args.dry_run)
     else:
         print("Please specify an action. Usage examples:")
         print("  python.exe data_manager.py --init")
         print("  python.exe data_manager.py --merge workout_songs.csv")
         print("  python data_manager.py --sync")
         print("  python data_manager.py --repair")
+        print("  python scripts/data_merging.py --clear-placeholders --dry-run")

@@ -8,7 +8,7 @@ import pandas as pd
 import pytest
 import soundfile as sf
 
-from core import feature_extraction as fe
+from scripts import feature_extraction as fe
 
 
 @pytest.fixture
