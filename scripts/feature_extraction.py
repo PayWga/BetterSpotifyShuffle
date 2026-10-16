@@ -1,9 +1,9 @@
 """Extract auditable acoustic measurements and safely update ShuffleRec's track catalog.
 
 Run from any directory:
-    python core/feature_extraction.py --dry-run --limit 10
-    python core/feature_extraction.py --limit 10
-    python core/feature_extraction.py --local-only
+    python scripts/feature_extraction.py --dry-run --limit 10
+    python scripts/feature_extraction.py --limit 100 --workers 4
+    python scripts/feature_extraction.py --analysis-seconds full
 
 Uses cached/local audio first, then searches YouTube using yt-dlp. Matching is
 conservative but heuristic; it cannot prove recording identity. Use audio with
@@ -20,7 +20,14 @@ import re
 import shutil
 import tempfile
 import unicodedata
+from collections import Counter, deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from contextlib import redirect_stderr
+from copy import copy
+from functools import cache
+from io import StringIO
 from pathlib import Path
+from time import perf_counter, sleep
 
 import librosa
 import numpy as np
@@ -38,6 +45,68 @@ ANALYSIS_SECONDS = 60
 EXTRACTOR_VERSION = "librosa_acoustics_v1"
 LOCAL_COLUMNS = ("local_rms_db", "local_onset_strength", "local_spectral_centroid", "local_spectral_contrast", "local_beat_regularity")
 FEATURE_COLUMNS = ("tempo", "key", "mode") + LOCAL_COLUMNS
+CSV_REPLACE_DELAYS = (.25, .5, 1., 2., 4.)
+
+
+class CookieConfigurationError(RuntimeError):
+    """Authentication could not be loaded before processing the backlog."""
+
+
+def load_youtube_cookies(cookie_file: Path | None, browser: str | None):
+    """Read opt-in authentication once; never export or rewrite its source."""
+    if cookie_file is None and browser is None:
+        return None
+    if cookie_file is not None and browser is not None:
+        raise CookieConfigurationError("Choose either --cookies or --cookies-from-browser, not both.")
+    if cookie_file is not None and not Path(cookie_file).is_file():
+        raise CookieConfigurationError("The supplied cookie file does not exist or is not a file.")
+    import yt_dlp
+    from yt_dlp.cookies import SUPPORTED_BROWSERS, load_cookies
+    specification = None
+    if browser is not None:
+        name, _, profile = browser.partition(":")
+        if name not in SUPPORTED_BROWSERS:
+            raise CookieConfigurationError("Unsupported cookie browser. Use BROWSER or BROWSER:PROFILE; "
+                                           "supported browsers: " + ", ".join(sorted(SUPPORTED_BROWSERS)))
+        specification = (name, profile) if profile else (name,)
+    try:
+        # yt-dlp can print raw malformed cookie lines even in quiet mode. Load
+        # before starting workers and suppress those potentially secret values.
+        # No cookiefile parameter on the loader means exiting cannot write back.
+        with redirect_stderr(StringIO()), yt_dlp.YoutubeDL({"quiet": True}) as loader:
+            jar = load_cookies(str(cookie_file) if cookie_file is not None else None,
+                               specification, loader)
+    except Exception:
+        raise CookieConfigurationError("Could not load cookies. For browser cookies, close the browser "
+                                       "and check the profile/decryption support; alternatively use "
+                                       "--cookies with a Netscape-format export. No tracks were attempted.") from None
+    if not len(jar):
+        raise CookieConfigurationError("No cookies were loaded. Check the cookie file or browser profile.")
+    return jar
+
+
+def youtube_session(options: dict, cookiejar=None):
+    """Give each yt-dlp context independent in-memory cookie objects."""
+    import yt_dlp
+    session = yt_dlp.YoutubeDL(options)
+    if cookiejar is not None:
+        from yt_dlp.cookies import YoutubeDLCookieJar
+        session.cookiejar = YoutubeDLCookieJar()
+        for cookie in cookiejar:
+            session.cookiejar.set_cookie(copy(cookie))
+    return session
+
+
+class CsvSaveBlocked(PermissionError):
+    """The prepared CSV remains available when destination access stays denied."""
+
+    def __init__(self, destination: Path, snapshot: Path):
+        self.destination = destination
+        self.snapshot = snapshot
+        super().__init__(
+            f"Cannot replace {destination} after {len(CSV_REPLACE_DELAYS) + 1} attempts. "
+            "Check programs holding the CSV open and file/folder permissions. "
+            f"Prepared snapshot retained at {snapshot}. The destination was not replaced by this save.")
 
 
 def text_value(value) -> str:
@@ -57,33 +126,80 @@ def artist_names(value) -> list[str]:
 
 
 def normalized(text: str) -> str:
+    text = re.sub(r"['’`]", "", text)
     text = unicodedata.normalize("NFKD", text.casefold())
     text = "".join(c for c in text if not unicodedata.combining(c))
     return " ".join(re.findall(r"\w+", text, flags=re.UNICODE))
 
 
-def match_score(item: dict, entry: dict) -> float | None:
-    """Reject obvious mismatches before ranking a small set of search results."""
-    title = normalized(text_value(item.get("track_name")))
+def canonical_title(text: str) -> str:
+    text = normalized(text)
+    text = re.sub(r"\b(?:ft|featuring)\b", "feat", text)
+    return re.sub(r"\bremastered\b", "remaster", text)
+
+
+def title_parts(text: str) -> tuple[str, str]:
+    text = canonical_title(text)
+    text = re.sub(r"(?:\s+(?:19|20)\d{2})?\s+remaster(?:\s+(?:19|20)\d{2})?$", "", text)
+    parts = text.split(" feat ", 1)
+    return parts[0], parts[1] if len(parts) == 2 else ""
+
+
+def credit_present(artist: str, credits: str) -> bool:
+    if f" {normalized(artist)} " in credits:
+        return True
+    # Spotify enrichment and many exports join collaborators with commas. Do
+    # not accept only the first artist: every separated credit must be present.
+    names = [name.strip() for name in re.split(r"[,;]", artist) if name.strip()]
+    return len(names) > 1 and all(f" {normalized(name)} " in credits for name in names)
+
+
+def match_result(item: dict, entry: dict) -> tuple[float | None, str]:
+    """Handle formatting variations without accepting conflicting recordings."""
+    title = canonical_title(text_value(item.get("track_name")))
+    core_title, featured = title_parts(text_value(item.get("track_name")))
     artists = artist_names(item.get("artist_name"))
-    candidate = normalized(text_value(entry.get("title")))
+    candidate = canonical_title(text_value(entry.get("title")))
     if not title or not artists or not candidate or entry.get("is_live"):
-        return None
+        return None, "missing_metadata_or_live_stream"
     words = set(candidate.split())
-    if f" {title} " not in f" {candidate} ":
-        return None
-    credits = " " + " ".join([candidate] + [normalized(text_value(entry.get(k)))
+    if not core_title or f" {core_title} " not in f" {candidate} ":
+        return None, "title"
+    credits = " " + " ".join([candidate] + [normalized(re.sub(r"(?i)vevo$", "", text_value(entry.get(k))))
                                            for k in ("uploader", "channel", "artist")]) + " "
-    if not all(" " + normalized(artist) + " " in credits for artist in artists):
-        return None
+    if not all(credit_present(artist, credits) for artist in artists) or (featured and not credit_present(featured, credits)):
+        return None, "artist"
+    # A wider search must not accept a different title merely containing the
+    # requested phrase (e.g. "Another Example Song" for "Example Song").
+    raw_candidate = text_value(entry.get("title"))
+    parts = re.split(r"\s+[-–—]\s+", raw_candidate, maxsplit=1)
+    song_title = raw_candidate
+    if len(parts) == 2 and any(credit_present(artist, " " + normalized(parts[0]) + " ") for artist in artists):
+        song_title = parts[1]
+    candidate_core, _ = title_parts(song_title)
+    if f" {core_title} " not in f" {candidate_core} ":
+        return None, "title"
+    remaining = f" {candidate_core} ".replace(f" {core_title} ", " ")
+    for artist in artists:
+        for name in [artist] + re.split(r"[,;]", artist):
+            remaining = remaining.replace(f" {normalized(name.strip())} ", " ")
+    noise = {"official", "audio", "video", "music", "lyric", "lyrics", "visualizer",
+             "visualiser", "hd", "hq", "4k", "1080p", "officialaudio", "officialvideo"}
+    requested_labels = set(title.split()) - set(core_title.split())
+    if set(remaining.split()) - noise - requested_labels:
+        return None, "title"
     versions = {"live", "cover", "remix", "acoustic", "karaoke", "instrumental",
-                "slowed", "sped", "nightcore", "remaster", "remastered", "demo", "edit"}
+                "slowed", "sped", "nightcore", "remaster", "demo", "edit", "reverb"}
     # Version terms belonging to the artist's name are not recording labels.
     requested = set(normalized(title + " " + " ".join(artists)).split())
     if (words & versions) - requested:
-        return None
+        return None, "version"
     if (set(title.split()) & versions) - words:
-        return None
+        return None, "version"
+    if "remaster" in title.split():
+        years = set(re.findall(r"\b(?:19|20)\d{2}\b", title))
+        if not years.issubset(words):
+            return None, "remaster_year"
     score = 1.0
     expected_ms = pd.to_numeric(item.get("duration_ms"), errors="coerce")
     actual = pd.to_numeric(entry.get("duration"), errors="coerce")
@@ -91,11 +207,29 @@ def match_score(item: dict, entry: dict) -> float | None:
         expected = expected_ms / 1000
         error = abs(actual - expected)
         if error > max(12., expected * .12):
-            return None
+            return None, "duration"
         score += 1 - error / max(12., expected * .12)
     if "topic" in normalized(text_value(entry.get("channel") or entry.get("uploader"))):
         score += .25
-    return score
+    return score, "matched"
+
+
+def match_score(item: dict, entry: dict) -> float | None:
+    return match_result(item, entry)[0]
+
+
+def acquisition_error_code(exc: Exception) -> str:
+    message = str(exc).casefold()
+    if message.startswith("resolved_recording_mismatch:"):
+        return message
+    for status in (429, 403):
+        if re.search(rf"\b(?:http(?: error)?|status(?: code)?)\s*[:=]?\s*{status}\b", message):
+            return f"http_{status}"
+    for text, code in (("sign in", "authentication_required"), ("not available", "unavailable"),
+                       ("private video", "unavailable"), ("timed out", "network_timeout")):
+        if text in message:
+            return code
+    return type(exc).__name__
 
 
 def audio_source(audio: Path) -> str:
@@ -108,8 +242,8 @@ def audio_source(audio: Path) -> str:
     return str(audio.resolve())
 
 
-def acquire_audio(item: dict, audio_dir: Path) -> tuple[Path | None, str | None]:
-    """Search five candidates, download the best match, and cache its provenance."""
+def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path | None, str | None]:
+    """Search conservatively, with a broader fallback query and isolated downloads."""
     tid = str(item["track_id"])
     if not re.fullmatch(r"[A-Za-z0-9_-]+", tid):
         raise ValueError("invalid_track_id")
@@ -129,65 +263,136 @@ def acquire_audio(item: dict, audio_dir: Path) -> tuple[Path | None, str | None]
     runtimes = {runtime: {} for runtime in ("deno", "node") if shutil.which(runtime)}
     if runtimes:
         common["js_runtimes"] = runtimes
-    try:
-        with yt_dlp.YoutubeDL({**common, "extract_flat": "in_playlist"}) as search:
-            info = search.extract_info(f"ytsearch5:{' '.join(artists)} {title} official audio", download=False)
-    except yt_dlp.utils.DownloadError as exc:
-        raise RuntimeError("search_failed: check network access and yt-dlp version") from exc
-    candidates = []
-    for entry in (info or {}).get("entries", []) or []:
-        if not entry:
-            continue
-        score = match_score(item, entry)
-        url = entry.get("webpage_url") or entry.get("url")
-        if score is not None and url:
-            candidates.append((score, url))
-    if not candidates:
-        return None, None
-    audio_dir.mkdir(parents=True, exist_ok=True)
     options = {**common, "format": "bestaudio/best", "overwrites": False,
                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}]}
-    errors = []
-    for _, url in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+    core, _ = title_parts(title)
+    versions = " remaster" if "remaster" in canonical_title(title).split() else ""
+    queries = [f"ytsearch5:{' '.join(artists)} {title} official audio",
+               f"ytsearch10:{' '.join(artists)} {core}{versions}"]
+    errors, search_errors, attempted = [], [], set()
+    rejections = Counter()
+    saw_results = False
+    search_time = download_time = conversion_time = 0.
+    for query in queries:
+        tick = perf_counter()
         try:
+            with youtube_session({**common, "extract_flat": "in_playlist"}, cookiejar) as search:
+                info = search.extract_info(query, download=False)
+        except yt_dlp.utils.DownloadError as exc:
+            code = acquisition_error_code(exc)
+            search_errors.append(code)
+            if code in ("http_429", "authentication_required"):
+                raise RuntimeError("search_failed: " + code) from exc
+            continue
+        finally:
+            search_time += perf_counter() - tick
+        candidates = []
+        for entry in (info or {}).get("entries", []) or []:
+            if not entry:
+                continue
+            saw_results = True
+            score, reason = match_result(item, entry)
+            url = entry.get("webpage_url") or entry.get("url")
+            if score is not None and url and url not in attempted:
+                candidates.append((score, url, entry))
+            elif score is None:
+                rejections[reason] += 1
+        for _, url, entry in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+            if url in attempted:
+                continue
+            attempted.add(url)
+            audio_dir.mkdir(parents=True, exist_ok=True)
             # Never resume one recording's partial download as another recording.
             # Retain failed staging files for inspection rather than deleting them.
             staging = Path(tempfile.mkdtemp(prefix=f".{tid}_", dir=audio_dir))
-            with yt_dlp.YoutubeDL({**options, "outtmpl": str(staging / f"{tid}.%(ext)s")}) as downloader:
-                result = downloader.extract_info(url, download=True)
-            audio = staging / f"{tid}.wav"
-            if not audio.is_file() or audio.stat().st_size == 0:
-                raise RuntimeError("download produced no converted WAV")
-            source = result.get("webpage_url") or url
-            sidecar = audio.with_suffix(".source.json")
-            sidecar.write_text(
-                json.dumps({"url": source, "title": result.get("title"),
-                            "matching": "artist_title_version_duration_v1"}, ensure_ascii=False),
-                encoding="utf-8")
-            # Publish provenance first, so an interrupted run cannot expose an
-            # acquired WAV at the cache root without its source.
-            destination = audio_dir / f"{tid}.wav"
-            os.replace(sidecar, destination.with_suffix(".source.json"))
-            os.replace(audio, destination)
-            return destination, source
-        except Exception as exc:
-            errors.append(type(exc).__name__)
-            LOG.warning("Download candidate failed for %s (%s)", tid, type(exc).__name__)
-    raise RuntimeError("download_failed: " + ", ".join(errors))
+            tick = perf_counter()
+            conversion_started, converted = None, 0.
+
+            def postprocess_hook(event):
+                nonlocal conversion_started, converted
+                if event.get("postprocessor") not in ("ExtractAudio", "FFmpegExtractAudio"):
+                    return
+                if event.get("status") == "started":
+                    conversion_started = perf_counter()
+                elif event.get("status") == "finished" and conversion_started is not None:
+                    converted += perf_counter() - conversion_started
+                    conversion_started = None
+
+            try:
+                with youtube_session({**options, "outtmpl": str(staging / f"{tid}.%(ext)s"),
+                                      "postprocessor_hooks": [postprocess_hook]}, cookiejar) as downloader:
+                    result = downloader.extract_info(url, download=True)
+                resolved_score, reason = match_result(item, {**entry, **result})
+                if resolved_score is None:
+                    raise RuntimeError("resolved_recording_mismatch: " + reason)
+                audio = staging / f"{tid}.wav"
+                if not audio.is_file() or audio.stat().st_size == 0:
+                    raise RuntimeError("download produced no converted WAV")
+                source = result.get("webpage_url") or url
+                sidecar = audio.with_suffix(".source.json")
+                sidecar.write_text(json.dumps({"url": source, "title": result.get("title"),
+                    "matching": "artist_title_version_duration_v2"}, ensure_ascii=False), encoding="utf-8")
+                destination = audio_dir / f"{tid}.wav"
+                os.replace(sidecar, destination.with_suffix(".source.json"))
+                os.replace(audio, destination)
+                return destination, source
+            except Exception as exc:
+                code = acquisition_error_code(exc)
+                errors.append(code)
+                LOG.warning("Download candidate failed for %s (%s)", tid, code)
+                if code in ("http_429", "authentication_required"):
+                    raise RuntimeError("download_failed: " + code) from exc
+            finally:
+                if conversion_started is not None:
+                    converted += perf_counter() - conversion_started
+                conversion_time += converted
+                download_time += max(0., perf_counter() - tick - converted)
+                LOG.info("Acquisition %s: search %.2fs, resolve/download %.2fs, conversion %.2fs",
+                         tid, search_time, download_time, conversion_time)
+    LOG.warning("No acquired audio for %s; rejected candidates: %s", tid, dict(rejections))
+    if errors:
+        raise RuntimeError("download_failed: " + ", ".join(sorted(set(errors))))
+    if search_errors:
+        raise RuntimeError("search_failed: " + ", ".join(sorted(set(search_errors))))
+    raise RuntimeError("no_matching_recording" if saw_results else "no_search_results")
 
 
 def atomic_csv(df: pd.DataFrame, path: Path) -> None:
-    """Replace an entire CSV safely against interrupted writes (not concurrent writers)."""
+    """Serialize once, retry transient sharing errors, retain complete failed saves.
+
+    This does not permit concurrent writers. If the destination changes while
+    preparing or retrying a save, abort rather than overwrite external updates.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
+    original_signature = file_signature(path) if path.exists() else None
     fd, temp = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".csv", dir=path.parent)
+    prepared = False
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
             df.to_csv(f, index=False)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(temp, path)
+        prepared = True
+        for attempt in range(len(CSV_REPLACE_DELAYS) + 1):
+            current_signature = file_signature(path) if path.exists() else None
+            if current_signature != original_signature:
+                raise RuntimeError(f"CSV changed while preparing/retrying save: {path}. "
+                                   f"Prepared snapshot retained at {temp}; external updates were not overwritten.")
+            try:
+                os.replace(temp, path)
+                return
+            except PermissionError as exc:
+                if attempt == len(CSV_REPLACE_DELAYS):
+                    raise CsvSaveBlocked(path, Path(temp)) from exc
+                delay = CSV_REPLACE_DELAYS[attempt]
+                LOG.warning("Access denied replacing %s; retry %d/%d in %.2fs. "
+                            "The prepared CSV is retained while waiting.",
+                            path.name, attempt + 1, len(CSV_REPLACE_DELAYS), delay)
+                sleep(delay)
     finally:
-        if os.path.exists(temp):
+        # A complete snapshot is useful for recovery after failed replacement;
+        # incomplete serialization artifacts must not be mistaken for snapshots.
+        if not prepared and os.path.exists(temp):
             os.unlink(temp)
 
 
@@ -221,8 +426,8 @@ def key_mode(y: np.ndarray, sr: int) -> tuple[float, float]:
     return (float(key), float(mode)) if score >= 0.35 else (np.nan, np.nan)
 
 
-def rhythm(y: np.ndarray, sr: int) -> tuple[float, float]:
-    tempo, frames = librosa.beat.beat_track(y=y, sr=sr)
+def rhythm(y: np.ndarray, sr: int, onset_envelope: np.ndarray | None = None) -> tuple[float, float]:
+    tempo, frames = librosa.beat.beat_track(y=y, sr=sr, onset_envelope=onset_envelope)
     tempo = float(np.atleast_1d(tempo)[0])
     if len(frames) < 4 or not np.isfinite(tempo) or tempo <= 0:
         return np.nan, np.nan
@@ -234,7 +439,7 @@ def rhythm(y: np.ndarray, sr: int) -> tuple[float, float]:
     return tempo, float(np.clip(regularity, 0, 1))
 
 
-def extract_audio_features(audio_path: Path, seconds: float = ANALYSIS_SECONDS) -> dict[str, float] | None:
+def extract_audio_features(audio_path: Path, seconds: float | None = ANALYSIS_SECONDS) -> dict[str, float | str] | None:
     """Partial acoustic estimates; missing/unreliable measurements remain NaN.
 
     Local descriptors are NOT Spotify energy/danceability/instrumentalness.
@@ -253,12 +458,28 @@ def extract_audio_features(audio_path: Path, seconds: float = ANALYSIS_SECONDS) 
     result = {column: np.nan for column in FEATURE_COLUMNS}
     result["local_rms_db"] = float(20 * np.log10(rms))
 
+    @cache
+    def log_mel():
+        mel = librosa.feature.melspectrogram(S=spectrum() ** 2, sr=sr)
+        return librosa.power_to_db(mel)
+
+    @cache
+    def onset_envelope(aggregation):
+        # beat_track(y=...) uses median aggregation; the standalone onset
+        # descriptor uses mean. Share their transform, not their aggregation.
+        aggregate = np.median if aggregation == "median" else np.mean
+        return librosa.onset.onset_strength(S=log_mel(), sr=sr, aggregate=aggregate)
+
+    @cache
+    def spectrum():
+        return np.abs(librosa.stft(y))
+
     analyses = {
-        "rhythm": lambda: rhythm(y, sr),
+        "rhythm": lambda: rhythm(y, sr, onset_envelope=onset_envelope("median")),
         "tonality": lambda: key_mode(y, sr),
-        "onset": lambda: float(np.mean(librosa.onset.onset_strength(y=y, sr=sr))),
-        "centroid": lambda: float(np.mean(librosa.feature.spectral_centroid(y=y, sr=sr))),
-        "contrast": lambda: float(np.mean(librosa.feature.spectral_contrast(y=y, sr=sr))),
+        "onset": lambda: float(np.mean(onset_envelope("mean"))),
+        "centroid": lambda: float(np.mean(librosa.feature.spectral_centroid(S=spectrum(), sr=sr))),
+        "contrast": lambda: float(np.mean(librosa.feature.spectral_contrast(S=spectrum(), sr=sr))),
     }
     for name, compute in analyses.items():
         try:
@@ -275,6 +496,8 @@ def extract_audio_features(audio_path: Path, seconds: float = ANALYSIS_SECONDS) 
     for col, value in result.items():
         if not np.isfinite(value):
             result[col] = np.nan
+    result["_analysis_seconds"] = len(y) / sr
+    result["_extractor_version"] = EXTRACTOR_VERSION
     return result
 
 
@@ -311,68 +534,208 @@ def read_master(path: Path) -> pd.DataFrame:
     return master.set_index("id")
 
 
-def save_batch(results: list[dict], master_path: Path) -> None:
-    """Fill missing catalog values only. Keep existing values and unrelated columns."""
+def save_batch(results: list[dict], master_path: Path,
+               master: pd.DataFrame | None = None) -> pd.DataFrame | None:
+    """Fill missing values; append new rows together and return the saved snapshot.
+
+    Supplying the coordinator's master avoids rereading the whole CSV at every
+    checkpoint. The two-argument form remains available for standalone callers.
+    """
     if not results:
-        return
-    master = read_master(master_path)
+        return master
+    if master is None:
+        master = read_master(master_path)
+    new_rows = {}
     for record in results:
         track_id = record["track_id"]
-        if track_id not in master.index:
+        if track_id not in master.index and track_id not in new_rows:
             operational = {"track_id", "attempts", "last_error", "audio_file", "audio_source"}
             metadata = {key: value for key, value in record.items()
-                        if key not in operational and key not in FEATURE_COLUMNS and key != "id"}
+                        if key not in operational and key not in FEATURE_COLUMNS
+                        and key != "id" and not key.startswith("_")}
             metadata.setdefault("name", record.get("track_name"))
             metadata.setdefault("artists", record.get("artist_name"))
-            new_row = pd.DataFrame([metadata], index=pd.Index([track_id], name="id"))
-            master = pd.concat([master, new_row])
-        for col in FEATURE_COLUMNS:
+            new_rows[track_id] = metadata
+    if new_rows:
+        incoming = pd.DataFrame.from_dict(new_rows, orient="index")
+        incoming.index.name = "id"
+        for col in incoming.columns.difference(master.columns):
+            master[col] = pd.Series(pd.NA, index=master.index, dtype="string")
+        incoming = incoming.reindex(columns=master.columns)
+        # Match schema once on the small incoming frame. This also preserves
+        # extension dtypes when a row lacks optional name/artist metadata.
+        for col in master.columns:
+            incoming[col] = incoming[col].astype(master[col].dtype)
+        master = pd.concat([master, incoming])
+    # Allocate/cast columns once per checkpoint, not for every track.
+    active = [col for col in FEATURE_COLUMNS if any(pd.notna(row.get(col, np.nan)) for row in results)]
+    for col in active:
+        if col not in master:
+            master[col] = np.nan
+        for suffix in ("_source", "_audio_source"):
+            name = col + suffix
+            if name not in master:
+                master[name] = pd.Series(pd.NA, index=master.index, dtype="string")
+            elif not isinstance(master[name].dtype, pd.StringDtype):
+                master[name] = master[name].astype("string")
+        duration = col + "_analysis_seconds"
+        if duration not in master:
+            master[duration] = np.nan
+        else:
+            master[duration] = master[duration].astype(object)
+    for record in results:
+        track_id = record["track_id"]
+        for col in active:
             val = record.get(col, np.nan)
             if pd.isna(val):
                 continue
-            if col not in master.columns:
-                master[col] = np.nan
-            provenance = f"{col}_source"
-            if provenance not in master.columns:
-                master[provenance] = pd.Series(pd.NA, index=master.index, dtype="string")
-            if not isinstance(master[provenance].dtype, pd.StringDtype):
-                master[provenance] = master[provenance].astype("string")
             if pd.isna(master.at[track_id, col]):
                 master.at[track_id, col] = val
-                master.at[track_id, provenance] = EXTRACTOR_VERSION
-                source_col = f"{col}_audio_source"
-                if source_col not in master:
-                    master[source_col] = pd.Series(pd.NA, index=master.index, dtype="string")
-                if not isinstance(master[source_col].dtype, pd.StringDtype):
-                    master[source_col] = master[source_col].astype("string")
-                master.at[track_id, source_col] = record.get("audio_source", record.get("audio_file", pd.NA))
+                master.at[track_id, col + "_source"] = record.get("_extractor_version", EXTRACTOR_VERSION)
+                master.at[track_id, col + "_audio_source"] = record.get("audio_source", record.get("audio_file", pd.NA))
+                master.at[track_id, col + "_analysis_seconds"] = record.get("_analysis_seconds", np.nan)
     atomic_csv(master.reset_index(), master_path)
+    return master
+
+
+def prepare_track(item: dict, audio_dir: Path, local_only: bool,
+                  dry_run: bool, *, cookiejar=None) -> tuple[dict | None, str | None, float]:
+    """Acquisition stage: return an audio path, never a decoded signal or CSV."""
+    tid = str(item["track_id"])
+    started = perf_counter()
+    LOG.info("Processing %s", tid)
+    try:
+        audio = find_local_audio(tid, audio_dir)
+        source = audio_source(audio) if audio else None
+        if audio is None and not local_only and not dry_run:
+            auth = {"cookiejar": cookiejar} if cookiejar is not None else {}
+            audio, source = acquire_audio(item, audio_dir, **auth)
+    except Exception as exc:
+        reason = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
+        LOG.warning("Audio acquisition failed for %s: %s", tid, reason[:200])
+        return None, reason[:200], perf_counter() - started
+    acquired = perf_counter() - started
+    if audio is None:
+        return None, "audio_not_found", acquired
+    return {"item": item, "audio": audio, "source": source, "acquired": acquired}, None, acquired
+
+
+def analyze_track(prepared: dict, analysis_seconds: float | None) -> tuple[dict | None, str | None, float]:
+    """Analysis stage: decode only when an analysis worker is available."""
+    item, audio, source = prepared["item"], prepared["audio"], prepared["source"]
+    tid = str(item["track_id"])
+    started = perf_counter()
+    try:
+        features = extract_audio_features(audio, seconds=analysis_seconds)
+    except Exception as exc:
+        LOG.warning("Analysis failed for %s (%s)", tid, type(exc).__name__)
+        return None, "analysis_failed: " + type(exc).__name__, perf_counter() - started
+    analyzed = perf_counter() - started
+    LOG.info("Finished %s: acquisition %.2fs, analysis %.2fs", tid, prepared["acquired"], analyzed)
+    if features is None:
+        return None, "invalid_audio", analyzed
+    return {**item, **features, "audio_file": str(audio), "audio_source": source}, None, analyzed
+
+
+def process_track(item: dict, audio_dir: Path, local_only: bool,
+                  dry_run: bool, analysis_seconds: float | None) -> tuple[dict | None, str | None, float, float]:
+    """Compatibility entry point for processing a single track synchronously."""
+    prepared, error, acquired = prepare_track(item, audio_dir, local_only, dry_run)
+    if error:
+        return None, error, acquired, 0.
+    record, error, analyzed = analyze_track(prepared, analysis_seconds)
+    return record, error, acquired, analyzed
+
+
+def file_signature(path: Path) -> tuple[int, int]:
+    stat = path.stat()
+    return stat.st_mtime_ns, stat.st_size
 
 
 def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
-            audio_dir: Path = AUDIO_DIR, batch_size: int = 10, max_attempts: int = 3,
+            audio_dir: Path = AUDIO_DIR, batch_size: int = 100, max_attempts: int = 3,
             dry_run: bool = False, local_only: bool = False,
-            limit: int | None = None, retry_failed: bool = False) -> dict[str, int]:
-    """Process each eligible backlog item once; commit batches then remove successes."""
+            limit: int | None = None, retry_failed: bool = False,
+            workers: int | None = None, analysis_seconds: float | None = ANALYSIS_SECONDS,
+            acquisition_workers: int | None = None, analysis_workers: int | None = None,
+            queue_size: int | None = None, *, cookies: Path | None = None,
+            cookies_from_browser: str | None = None) -> dict[str, int]:
+    """Two independently sized stages, bounded ready paths, one CSV coordinator."""
     if not master_path.exists():
         raise FileNotFoundError(f"Missing master database: {master_path}")
     if not backlog_path.exists():
         raise FileNotFoundError(f"Missing backlog: {backlog_path}")
-    if batch_size <= 0 or max_attempts <= 0:
-        raise ValueError("batch_size and max_attempts must be positive")
+    if batch_size <= 0 or max_attempts <= 0 or (workers is not None and workers <= 0):
+        raise ValueError("batch_size, max_attempts and workers must be positive")
+    acquisition_workers = (workers or 8) if acquisition_workers is None else acquisition_workers
+    analysis_workers = (workers or 4) if analysis_workers is None else analysis_workers
+    queue_size = max(acquisition_workers, analysis_workers * 2) if queue_size is None else queue_size
+    if acquisition_workers <= 0 or analysis_workers <= 0 or queue_size <= 0:
+        raise ValueError("acquisition_workers, analysis_workers and queue_size must be positive")
+    if analysis_seconds is not None and (not np.isfinite(analysis_seconds) or analysis_seconds <= 0):
+        raise ValueError("analysis_seconds must be positive, or None for the full song")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be positive")
+    cookiejar = (load_youtube_cookies(cookies, cookies_from_browser)
+                 if not dry_run and not local_only else None)
+    acquisition_auth = {"cookiejar": cookiejar} if cookiejar is not None else {}
+    started = perf_counter()
+    signatures = {path: file_signature(path) for path in (master_path, backlog_path)}
     master = read_master(master_path)
     backlog = read_backlog(backlog_path)
     eligible = (backlog if retry_failed else backlog[backlog["attempts"] < max_attempts]).copy()
     if limit is not None:
         eligible = eligible.head(limit)
     stats = {"eligible": len(eligible), "saved": 0, "failed": 0}
-    LOG.info("Eligible backlog entries: %d", len(eligible))
-    for start in range(0, len(eligible), batch_size):
-        rows = eligible.iloc[start:start + batch_size]
-        successful, failures = [], {}
-        for item in rows.to_dict("records"):
+    LOG.info("Loaded catalogs in %.2fs; eligible %d, acquisition workers %d, analysis workers %d, queue %d, checkpoint %d",
+             perf_counter() - started, len(eligible), acquisition_workers, analysis_workers, queue_size, batch_size)
+    successful, failures, deferred = [], {}, {}
+    acquire_time = analyze_time = checkpoint_time = 0.
+    error_counts = Counter()
+    checkpoint_started = False
+    authentication_challenges = deferred_total = 0
+    acquisition_blocked = False
+
+    def checkpoint():
+        nonlocal master, backlog, checkpoint_time, checkpoint_started
+        if not successful and not failures and not deferred:
+            return
+        checkpoint_started = True
+        tick = perf_counter()
+        if dry_run:
+            LOG.info("DRY RUN: would save %d, mark %d failures, defer %d",
+                     len(successful), len(failures), len(deferred))
+        else:
+            for path, signature in signatures.items():
+                if file_signature(path) != signature:
+                    raise RuntimeError(f"Catalog changed during extraction: {path.name}; stop other writers")
+            if successful:
+                master = save_batch(successful, master_path, master=master)
+                signatures[master_path] = file_signature(master_path)
+            remaining = backlog[~backlog["track_id"].isin({row["track_id"] for row in successful})].copy()
+            for tid, message in failures.items():
+                mask = remaining["track_id"] == tid
+                remaining.loc[mask, "attempts"] += 1
+                remaining.loc[mask, "last_error"] = message
+            # Service challenges are not evidence that a track cannot be found.
+            # Record the reason without spending its retry allowance.
+            for tid, message in deferred.items():
+                remaining.loc[remaining["track_id"] == tid, "last_error"] = message
+            atomic_csv(remaining, backlog_path)
+            backlog = remaining
+            signatures[backlog_path] = file_signature(backlog_path)
+        stats["saved"] += len(successful)
+        stats["failed"] += len(failures)
+        elapsed = perf_counter() - tick
+        checkpoint_time += elapsed
+        LOG.info("Checkpoint: %d saved, %d failed (%.2fs)", stats["saved"], stats["failed"], elapsed)
+        successful.clear()
+        failures.clear()
+        deferred.clear()
+        checkpoint_started = False
+
+    def items():
+        for item in eligible.to_dict("records"):
             tid = str(item["track_id"])
             if tid in master.index:
                 metadata = master.loc[tid]
@@ -382,43 +745,106 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
                     if not text_value(item.get(target)):
                         item[target] = next((metadata[name] for name in names
                                              if name in metadata and text_value(metadata[name])), None)
-            LOG.info("Processing %s", tid)
-            try:
-                audio = find_local_audio(tid, audio_dir)
-                source = audio_source(audio) if audio else None
-                if audio is None and not local_only and not dry_run:
-                    audio, source = acquire_audio(item, audio_dir)
-            except Exception as exc:
-                # Persist a useful reason without storing URLs, tokens or full network responses.
-                reason = str(exc) if isinstance(exc, (RuntimeError, ValueError)) else type(exc).__name__
-                failures[tid] = reason[:200]
-                LOG.warning("Audio acquisition failed for %s: %s", tid, failures[tid])
+            yield item
+
+    iterator = iter(items())
+    acquisition_pool = ThreadPoolExecutor(max_workers=acquisition_workers, thread_name_prefix="acquire")
+    analysis_pool = ThreadPoolExecutor(max_workers=analysis_workers, thread_name_prefix="analyze")
+    acquiring, analyzing, ready = {}, {}, deque()
+    exhausted = False
+
+    try:
+        while True:
+            while ready and len(analyzing) < analysis_workers:
+                prepared = ready.popleft()
+                future = analysis_pool.submit(analyze_track, prepared, analysis_seconds)
+                analyzing[future] = str(prepared["item"]["track_id"])
+            # Reserve a queue slot for every acquisition in flight, so finished
+            # downloads can always be collected without blocking either stage.
+            while (not exhausted and not acquisition_blocked and len(acquiring) < acquisition_workers
+                   and len(ready) + len(acquiring) < queue_size):
+                item = next(iterator, None)
+                if item is None:
+                    exhausted = True
+                    break
+                future = acquisition_pool.submit(prepare_track, item, audio_dir, local_only, dry_run,
+                                                 **acquisition_auth)
+                acquiring[future] = str(item["track_id"])
+            pending = set(acquiring) | set(analyzing)
+            if not pending:
+                if not ready:
+                    break
                 continue
-            if audio is None:
-                failures[tid] = "audio_not_found"
-                continue
-            features = extract_audio_features(audio)
-            if features is None:
-                failures[tid] = "invalid_audio"
-                continue
-            successful.append({**item, **features, "audio_file": str(audio), "audio_source": source})
-        if dry_run:
-            LOG.info("DRY RUN: would save %d, mark %d failures", len(successful), len(failures))
-            stats["saved"] += len(successful)
-            stats["failed"] += len(failures)
-            continue
-        if successful:
-            save_batch(successful, master_path)
-            successful_ids = {r["track_id"] for r in successful}
-            backlog = backlog[~backlog["track_id"].isin(successful_ids)].copy()
-            stats["saved"] += len(successful)
-        for tid, message in failures.items():
-            mask = backlog["track_id"] == tid
-            backlog.loc[mask, "attempts"] += 1
-            backlog.loc[mask, "last_error"] = message
-            stats["failed"] += 1
-        atomic_csv(backlog, backlog_path)
+            done, _ = wait(pending, return_when=FIRST_COMPLETED)
+            for future in done:
+                if future in acquiring:
+                    tid = acquiring.pop(future)
+                    prepared, error, acquired = future.result()
+                    acquire_time += acquired
+                    if not error:
+                        ready.append(prepared)
+                        continue
+                    if ("authentication_required" in error or "http_429" in error):
+                        deferred[tid] = error
+                        deferred_total += 1
+                        error_counts[error] += 1
+                        authentication_challenges += int("authentication_required" in error)
+                        if not acquisition_blocked and ("http_429" in error or authentication_challenges >= 3):
+                            acquisition_blocked = True
+                            LOG.warning("Acquisition paused for this run after service challenges. "
+                                        "Finishing in-flight work; blocked and unstarted tracks keep "
+                                        "their attempt allowance. Check YouTube access before retrying.")
+                        if len(successful) + len(failures) + len(deferred) >= batch_size:
+                            checkpoint()
+                        continue
+                    record = None
+                else:
+                    tid = analyzing.pop(future)
+                    record, error, analyzed = future.result()
+                    analyze_time += analyzed
+                if error:
+                    failures[tid] = error
+                    error_counts[error] += 1
+                else:
+                    successful.append(record)
+                if len(successful) + len(failures) + len(deferred) >= batch_size:
+                    checkpoint()
+        checkpoint()
+    except KeyboardInterrupt:
+        # Completed results already collected by the coordinator are safe to save;
+        # in-flight tracks retain their backlog entries and their audio cache.
+        if not checkpoint_started:
+            checkpoint()
+        LOG.warning("Interrupted; completed checkpoints are retained, remaining backlog entries can be retried")
+        raise
+    finally:
+        for future in (*acquiring, *analyzing):
+            future.cancel()
+        acquisition_pool.shutdown(wait=True, cancel_futures=True)
+        analysis_pool.shutdown(wait=True, cancel_futures=True)
+    LOG.info("Timing: wall %.2fs, acquisition worker-time %.2fs, analysis worker-time %.2fs, checkpoints %.2fs",
+             perf_counter() - started, acquire_time, analyze_time, checkpoint_time)
+    if error_counts:
+        LOG.info("Failure summary for this run: %s", dict(error_counts))
+    if deferred_total:
+        stats["deferred"] = (stats["eligible"] - stats["saved"] - stats["failed"]
+                             if acquisition_blocked else deferred_total)
+        LOG.warning("Deferred %d tracks without consuming attempts (%d challenged requests). "
+                    "Deferred includes unstarted tracks when acquisition was paused.",
+                    stats["deferred"], deferred_total)
     return stats
+
+
+def parse_analysis_seconds(value: str) -> float | None:
+    if value.casefold() == "full":
+        return None
+    try:
+        seconds = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("Use a positive number of seconds or 'full'") from exc
+    if not np.isfinite(seconds) or seconds <= 0:
+        raise argparse.ArgumentTypeError("Use a positive number of seconds or 'full'")
+    return seconds
 
 
 def main() -> None:
@@ -426,16 +852,34 @@ def main() -> None:
     parser.add_argument("--backlog", type=Path, default=BACKLOG_PATH)
     parser.add_argument("--master", type=Path, default=MASTER_PATH)
     parser.add_argument("--audio-dir", type=Path, default=AUDIO_DIR)
-    parser.add_argument("--batch-size", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=100, help="Completed tracks per CSV checkpoint (default: 100)")
     parser.add_argument("--max-attempts", type=int, default=3)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local-only", action="store_true", help="Disable audio search/download")
     parser.add_argument("--limit", type=int, help="Maximum number of tracks to process this run")
     parser.add_argument("--retry-failed", action="store_true", help="Include tracks at the attempt limit")
+    authentication = parser.add_mutually_exclusive_group()
+    authentication.add_argument("--cookies", type=Path, metavar="FILE",
+                                help="Read a Netscape-format cookie file without rewriting it")
+    authentication.add_argument("--cookies-from-browser", metavar="BROWSER[:PROFILE]",
+                                help="Load browser cookies once, e.g. chrome, edge, firefox or chrome:Default")
+    parser.add_argument("--workers", type=int, help="Compatibility shorthand: set both pool sizes")
+    parser.add_argument("--acquisition-workers", type=int, help="Concurrent searches/downloads (default: 8)")
+    parser.add_argument("--analysis-workers", type=int, help="Concurrent audio analyses (default: 4)")
+    parser.add_argument("--queue-size", type=int, help="Bound on ready paths plus acquisitions in flight (default: max(acquisition workers, twice analysis workers))")
+    parser.add_argument("--analysis-seconds", type=parse_analysis_seconds, default=ANALYSIS_SECONDS,
+                        help="Seconds of audio to analyze, or 'full' (default: 60)")
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    stats = process(args.backlog, args.master, args.audio_dir, args.batch_size, args.max_attempts,
-                    args.dry_run, args.local_only, args.limit, args.retry_failed)
+    try:
+        stats = process(args.backlog, args.master, args.audio_dir, args.batch_size, args.max_attempts,
+                        args.dry_run, args.local_only, args.limit, args.retry_failed,
+                        args.workers, args.analysis_seconds, args.acquisition_workers,
+                        args.analysis_workers, args.queue_size, cookies=args.cookies,
+                        cookies_from_browser=args.cookies_from_browser)
+    except (CsvSaveBlocked, CookieConfigurationError) as exc:
+        LOG.error("%s", exc)
+        raise SystemExit(1) from None
     print(json.dumps(stats, indent=2))
 
 

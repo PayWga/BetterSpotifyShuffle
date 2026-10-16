@@ -212,7 +212,8 @@ def test_download_enables_installed_node_runtime(tmp_path):
     item = {'track_id': 'song1', 'track_name': 'Example Song', 'artist_name': 'Example Artist'}
     with patch('yt_dlp.YoutubeDL') as downloader, patch.object(fe.shutil, 'which', return_value='executable'):
         downloader.return_value.__enter__.return_value.extract_info.return_value = {'entries': []}
-        assert fe.acquire_audio(item, tmp_path) == (None, None)
+        with pytest.raises(RuntimeError, match='no_search_results'):
+            fe.acquire_audio(item, tmp_path)
         assert 'node' in downloader.call_args.args[0]['js_runtimes']
 
 
