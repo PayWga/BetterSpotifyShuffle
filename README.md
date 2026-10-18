@@ -54,7 +54,12 @@ artist and title, rejects conflicting version labels, and compares duration when
 available (tolerance: 12 seconds or 12%, whichever is greater). It tries ranked
 matches until a download succeeds. If none succeeds, a second, broader query
 examines up to ten results without the "official audio" qualifier. Already tried
-URLs are not downloaded again. The same matching checks apply to both searches.
+URLs are not downloaded again. If both fail, a third query examines up to fifteen
+results using the primary artist and core title, retaining requested version
+checks. A final primary-artist/core-title query examines up to fifteen lyric
+video results without requiring a remaster label in the query. Queries can
+overlap; a candidate is attempted only once per track/run.
+The same final matching checks apply to all searches.
 These checks are heuristic and cannot prove
 that a result is the exact Spotify recording. Use recordings with appropriate
 permissions, and inspect cached `<track_id>.source.json` files when reviewing matches.
@@ -70,9 +75,51 @@ sidecars are published into the cache root.
 
 Matching tolerates apostrophe variations, `feat`/`ft` credits, equivalent
 `remaster`/`remastered` wording, comma/semicolon-separated artist credits, and
-VEVO channel suffixes. Every named collaborator must still be present. Different
-titles, cover/live/remix versions, different requested remaster years, and
-duration conflicts are rejected. After download, resolved metadata is checked
+VEVO channel suffixes, and presentation labels such as "Audio Only", "Full
+Audio", "Unofficial Lyrics Video", "Fan Made Lyric Video", and "Reupload".
+An official uploader is not required. Controlled presentation brackets (including
+lyric/Letra/Paroles labels and lyric-video author credits) are ignored when
+checking the song title; a different song merely containing the requested title
+is still rejected. When a search result
+matches the title/version/duration and primary artist but lacks collaborator
+credits, full metadata is fetched without downloading audio. Structured artist
+and creator fields can then establish the missing credits. If guest credits
+remain absent, a candidate can qualify only when the primary artist/title match
+and known duration differs by no more than **3 seconds or 2%, whichever is
+greater**. The same tighter duration rule permits a requested remaster to use an
+upload that omits its remaster label/year. This does not verify the exact master;
+an explicitly conflicting remaster year remains rejected. Missing duration is
+insufficient for either relaxation. Complete credits and explicit remaster
+matches rank above relaxed alternatives with otherwise equal evidence.
+Matching separates the base title from featured credits and recording labels.
+`(with Future)` and `(feat. Future)` are equivalent; Japanese `Version`/`Ver.`
+and explicit `(Japanese)` labels agree. Explicit language labels are required:
+an unmarked/Korean upload cannot substitute a Japanese version. Live/studio and
+stripped/regular recordings remain distinct. A non-Latin title with an explicit
+Latin-script alias can match that alias, e.g. `붐바야 (BOOMBAYAH)`. Artist/title
+order and recognized pipe-delimited lyric/uploader branding are handled without
+accepting unrelated additional song names. Fallback queries retain known
+language/live/stripped constraints.
+Source sidecars record `match_evidence` when guest/remaster identity is relaxed,
+using matching policy `structured_recording_identity_v6`.
+
+**A remix is eligible only when the backlog track itself requests a remix.** Remix/RMX,
+re-mix/remixed, bootleg, mashup, rework and alternate club/dance/DJ/extended/dub/
+festival mix labels are checked before presentation text is stripped. Candidate
+title, track, alternate-title, version and tag fields are checked, together with
+remixer credit fields. A requested named remix must match its title/version;
+an original or a different named remix is rejected. RMX, re-mix and remixed
+spellings normalize to remix. Plain "Original Mix" is allowed for originals;
+a generic unexplained "Mix" label is not. These checks depend on supplied metadata and cannot detect
+an unlabelled remix by listening to the waveform.
+The previous unconditional filter's `excluded_remix` status no longer suppresses
+tracks: these entries are eligible again even above the normal attempt limit,
+without resetting stored counters or requiring a manual CSV edit. No rows or
+existing features are deleted. Cached audio with incompatible remix sidecar
+metadata is bypassed and retained on disk while a matching recording is sought;
+cached audio for the requested remix remains usable.
+Different titles, conflicting cover/live versions, and duration conflicts remain
+rejected. After download, resolved metadata is checked
 again before the WAV and source sidecar are published; rejected downloads stay
 in their isolated staging directories.
 
@@ -113,6 +160,10 @@ reduces full CSV rewrites; it does not control concurrency. Use `--batch-size 10
 for more frequent saves at greater disk/serialization cost. `--max-attempts`
 still defaults to 3. Failed entries retain an attempt count and error reason;
 successful entries are removed only after their master updates are saved.
+With `--retry-failed`, tracks are selected by lowest attempt count first, keeping
+backlog order for ties, before applying `--limit`. Thus genuine failures move
+behind less-attempted tracks on later limited runs. Service-deferred tracks keep
+their attempt counts and may be selected again until service access is restored.
 
 Ctrl+C attempts to checkpoint results already collected by the coordinator;
 in-flight tracks retain their backlog entries and cached audio for a later run.
@@ -143,11 +194,20 @@ FFmpeg conversion time. Summed worker times can exceed wall time because stages 
 
 Failures now distinguish `no_search_results`, `no_matching_recording`,
 `missing_search_metadata`, `invalid_audio`, and search/download errors with codes
-such as `http_403`, `http_429`, `authentication_required`, and `network_timeout`.
-Rejected candidate counts are logged by reason, and the run ends with a failure
-histogram. Authentication challenges and HTTP 429 stop that track's candidate
-and fallback-search retries immediately. Three authentication-challenged tracks
-in one run, or a single HTTP 429, pause new acquisition for the rest of that run.
+such as `http_403`, `http_429`, `authentication_required`, `network_timeout`,
+`geo_restricted`, `session_reload_required`, and `js_challenge_failed`. Geographic
+classification requires an explicit country/region restriction in the error;
+ordinary unavailable/deleted recordings remain separate. Not every upstream
+error exposes a specific cause.
+Rejected candidate counts are deduplicated by URL/reason. Unsuccessful searches
+also log up to five candidate examples with rejection reason, title, uploader and
+URL. URL credentials, fragments and arbitrary query tokens are omitted. Redirect
+console output to a private log if you want to review these examples later.
+The run ends with a failure histogram. Authentication, session-reload, JavaScript
+challenge and HTTP 429 errors stop that track's candidate and fallback-search
+retries immediately. Three challenged tracks (any mix of authentication,
+session-reload or JavaScript errors) in one run, or a single HTTP 429, pause new
+acquisition for the rest of that run.
 Already-started acquisitions and queued/active analyses finish and checkpoint
 normally; there is no automatic timed resume. Challenged tracks record their
 error without increasing `attempts`. Unstarted tracks remain unchanged. The
@@ -202,6 +262,52 @@ unknown values to NaN before extraction. The notebook still needs explicit model
 availability/sequence masks and does not yet consume `local_*` features.
 
 ## Fill missing Spotify metadata
+
+### Enrich tracks in the audio backlog
+
+Backlog-only tracks may have no row in the master, so master backfill cannot
+supply their missing durations. With extraction and other backlog writers
+stopped, use the dedicated action:
+
+```powershell
+python scripts/data_merging.py --backfill-backlog --dry-run
+python scripts/data_merging.py --backfill-backlog --limit 50
+```
+
+After checking that small enrichment run, omit `--limit` to enrich the remaining
+backlog before retrying extraction. The enrichment limit and extraction limit
+can select different rows, so enriching only 50 rows does not guarantee that the
+next 50 extraction candidates have metadata.
+
+This reuses the existing private Spotify credentials/OAuth client and track API
+retry handling. It fills missing `duration_ms`, `isrc`, `track_name` and
+`artist_name`, and stores separate `spotify_track_name`, JSON
+`spotify_artist_names`, `spotify_resolved_id`, `spotify_metadata_source` and UTC
+`spotify_metadata_checked_at` fields. Existing values, attempts, last extraction
+errors, IDs and unrelated columns are preserved. Full Spotify artist credits
+are used for matching; the original displayed backlog identity is retained.
+Successful extraction carries enriched metadata into remaining gaps in the
+master, including tracks already present there.
+
+The action writes only the selected backlog (`--backlog PATH` can override it),
+not the master. It checkpoints approximately every 25 requests and on ordinary
+error/interrupt exit. Reruns skip rows with duration and both Spotify identity
+fields already present. ISRC is optional; unavailable ISRC alone does not cause
+repeated requests. API permission/authentication errors stop the run after saving
+completed enrichment; unavailable/invalid IDs get a separate
+`spotify_metadata_error`, leaving extraction attempt counts unchanged. Unknown
+response IDs are rejected unless Spotify explicitly links them to the requested
+ID. A timestamp/size conflict check aborts rather than overwriting a detected
+external update; concurrent backlog writers remain unsupported. Dry-run reads
+only: no authentication, API requests or writes.
+
+After enrichment, test extraction with your usual cookie option plus
+`--retry-failed --limit 20 --acquisition-workers 1`. Filling metadata does not
+reset the extraction attempt limit. Inspect rejected-candidate examples before
+scaling up; offline regression fixtures do not establish the recovery rate on
+your full catalog.
+
+### Enrich tracks already in the master
 
 `--sync` still adds tracks from listening history that are absent from the master
 catalog. `--backfill` checks **all existing master tracks**, independent of listening

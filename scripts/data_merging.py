@@ -352,6 +352,12 @@ def backfill_metadata(master_path=None, checkpoint=None, **options):
                                      save_database, **options)
 
 
+def backfill_backlog_metadata(backlog_path=None, **options):
+    """Enrich backlog-only tracks without adding or rewriting master rows."""
+    path = Path(DATA_DIR / 'dsp_backlog.csv' if backlog_path is None else backlog_path)
+    return spotify_metadata.backfill_backlog(path, get_spotify_client, save_database, **options)
+
+
 def apply_metadata_checkpoint(master_path=None, checkpoint=None, dry_run=False):
     """Run after all other catalog writers have stopped."""
     master_path = Path(MASTER_DB if master_path is None else master_path)
@@ -504,10 +510,12 @@ if __name__ == "__main__":
     actions.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
     actions.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
     actions.add_argument("--backfill", action="store_true", help="Fill missing Spotify metadata for existing master tracks")
+    actions.add_argument("--backfill-backlog", action="store_true", help="Fill missing duration/recording metadata directly in the audio backlog")
     actions.add_argument("--apply-backfill", action="store_true", help="Apply a metadata checkpoint after other catalog writers stop")
     actions.add_argument("--repair", action="store_true", help="Clean identifiers, duplicates, and invalid feature values")
     actions.add_argument("--clear-placeholders", action="store_true", help="Convert exact -1 sentinels in known nonnegative columns to NaN")
     parser.add_argument("--master", type=Path, help="Master CSV for placeholder cleanup or metadata backfill")
+    parser.add_argument("--backlog", type=Path, help="Backlog CSV for --backfill-backlog")
     parser.add_argument("--dry-run", action="store_true", help="Preview cleanup/backfill/apply without writing or API requests")
     parser.add_argument("--checkpoint", type=Path, help="Resumable metadata JSON (default: beside the selected master)")
     parser.add_argument("--fetch-only", action="store_true", help="Fetch to checkpoint only; safe while extraction runs")
@@ -517,12 +525,18 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     enrichment = args.backfill or args.apply_backfill
-    if (args.master is not None or args.dry_run) and not (args.clear_placeholders or enrichment):
+    if args.master is not None and not (args.clear_placeholders or enrichment):
         parser.error("--master and --dry-run require --clear-placeholders, --backfill, or --apply-backfill")
+    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog):
+        parser.error("--dry-run requires a cleanup or metadata action")
+    if args.backlog is not None and not args.backfill_backlog:
+        parser.error("--backlog requires --backfill-backlog")
     if args.checkpoint is not None and not enrichment:
         parser.error("--checkpoint requires --backfill or --apply-backfill")
-    if (args.fetch_only or args.limit is not None or args.fields or args.extra_metadata) and not args.backfill:
+    if (args.fetch_only or args.fields or args.extra_metadata) and not args.backfill:
         parser.error("--fetch-only, --limit, --fields, and --extra-metadata require --backfill")
+    if args.limit is not None and not (args.backfill or args.backfill_backlog):
+        parser.error("--limit requires --backfill or --backfill-backlog")
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     
@@ -536,6 +550,8 @@ if __name__ == "__main__":
         backfill_metadata(args.master, args.checkpoint, dry_run=args.dry_run,
                           fetch_only=args.fetch_only, limit=args.limit,
                           fields=args.fields, extra_metadata=args.extra_metadata)
+    elif args.backfill_backlog:
+        backfill_backlog_metadata(args.backlog, dry_run=args.dry_run, limit=args.limit)
     elif args.apply_backfill:
         apply_metadata_checkpoint(args.master, args.checkpoint, args.dry_run)
     elif args.repair:

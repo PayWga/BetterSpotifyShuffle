@@ -40,6 +40,8 @@ def test_authentication_challenge_stops_candidate_and_search_retries(tmp_path, d
 
 @pytest.mark.parametrize('reason, expected_requests', [
     ('download_failed: authentication_required', 3),
+    ('download_failed: session_reload_required', 3),
+    ('download_failed: js_challenge_failed', 3),
     ('search_failed: http_429', 1)])
 def test_block_stops_new_requests_preserves_attempts_and_saves_ready_audio(tmp_path, reason, expected_requests):
     master, backlog, audio = tmp_path / 'master.csv', tmp_path / 'backlog.csv', tmp_path / 'audio'

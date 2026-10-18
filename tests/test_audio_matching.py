@@ -9,12 +9,12 @@ from scripts import feature_extraction as fe
 
 @pytest.mark.parametrize('requested,artist,title,channel,expected', [
     ('Example Song', 'Main Artist, Guest Artist', 'Main Artist feat. Guest Artist - Example Song', '', True),
-    ('Example Song', 'Main Artist, Guest Artist', 'Main Artist - Example Song', '', False),
+    ('Example Song', 'Main Artist, Guest Artist', 'Main Artist - Example Song', '', True),
     ('Example Song (feat. Guest Artist)', 'Main Artist', 'Main Artist ft. Guest Artist - Example Song', '', True),
-    ('Example Song (feat. Guest Artist)', 'Main Artist', 'Main Artist - Example Song', '', False),
+    ('Example Song (feat. Guest Artist)', 'Main Artist', 'Main Artist - Example Song', '', True),
     ('Example Song - 2011 Remaster', 'Main Artist', 'Main Artist - Example Song (Remastered 2011)', '', True),
     ('Example Song - 2011 Remaster', 'Main Artist', 'Main Artist - Example Song (Remastered 2011) (Official Audio)', '', True),
-    ('Example Song - 2011 Remaster', 'Main Artist', 'Main Artist - Example Song', '', False),
+    ('Example Song - 2011 Remaster', 'Main Artist', 'Main Artist - Example Song', '', True),
     ("Don't Stop", 'Main Artist', 'Main Artist - Dont Stop', '', True),
     ('Example Song', 'Main Artist', 'Example Song (Official Video)', 'Main ArtistVEVO', True),
     ('Example Song', 'Main Artist', 'Main Artist - Example Song (Live)', '', False),
@@ -78,7 +78,7 @@ def test_empty_search_results_have_specific_error(tmp_path):
     ('HTTP Error 403: Forbidden', 'http_403'),
     ('HTTP Error 429: Too Many Requests', 'http_429'),
     ('Sign in to confirm you are not a bot', 'authentication_required'),
-    ('Video not available in your country', 'unavailable'),
+    ('Video not available in your country', 'geo_restricted'),
     ('Connection timed out', 'network_timeout'),
 ])
 def test_download_errors_have_actionable_categories(message, expected):

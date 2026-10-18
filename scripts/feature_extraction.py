@@ -28,6 +28,7 @@ from functools import cache
 from io import StringIO
 from pathlib import Path
 from time import perf_counter, sleep
+from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
 
 import librosa
 import numpy as np
@@ -46,6 +47,8 @@ EXTRACTOR_VERSION = "librosa_acoustics_v1"
 LOCAL_COLUMNS = ("local_rms_db", "local_onset_strength", "local_spectral_centroid", "local_spectral_contrast", "local_beat_regularity")
 FEATURE_COLUMNS = ("tempo", "key", "mode") + LOCAL_COLUMNS
 CSV_REPLACE_DELAYS = (.25, .5, 1., 2., 4.)
+DEFERRED_ACQUISITION_CODES = ("authentication_required", "http_429",
+                              "session_reload_required", "js_challenge_failed")
 
 
 class CookieConfigurationError(RuntimeError):
@@ -133,16 +136,68 @@ def normalized(text: str) -> str:
 
 
 def canonical_title(text: str) -> str:
+    text = re.sub(r"(?i)(\(\s*)with\b", r"\1feat", text)
     text = normalized(text)
     text = re.sub(r"\b(?:ft|featuring)\b", "feat", text)
-    return re.sub(r"\bremastered\b", "remaster", text)
+    text = re.sub(r"\b(?:rmx|re\s+mix|remixed)\b", "remix", text)
+    text = re.sub(r"\bremastered\b", "remaster", text)
+    text = re.sub(r"\b(japanese|korean|english|chinese) ver\b", r"\1 version", text)
+    text = re.sub(r"\b(?:jp|jpn) (?:ver|version)\b", "japanese version", text)
+    text = re.sub(r"\bstripped (?:down|back)(?: version)?\b", "stripped", text)
+    return re.sub(r"\bm v\b", "music video", text)
+
+
+def language_annotation(text: str) -> str | None:
+    label = canonical_title(text)
+    match = re.fullmatch(r"(japanese|korean|english|chinese)(?: (?:version|official|music|video|audio))*", label)
+    return match.group(1) if match else None
+
+
+def recording_languages(text: str) -> set[str]:
+    labels = re.split(r"[()\[\]「」]|\s+[-–—]\s+", text)
+    languages = {value for label in labels if (value := language_annotation(label))}
+    languages.update(re.findall(r"\b(japanese|korean|english|chinese) version\b", canonical_title(text)))
+    return languages
+
+
+def recording_annotation(text: str) -> bool:
+    return bool(language_annotation(text) or re.fullmatch(
+        r"(?:live|stripped|acoustic|instrumental|karaoke|cover|demo|sped up|slowed|"
+        r"(?:(?:19|20)\d{2} )?remaster(?: (?:19|20)\d{2})?)(?: version)?", canonical_title(text)))
+
+
+def bilingual_title(text: str) -> str:
+    """Recognize a non-Latin title followed by its explicit Latin-script alias."""
+    def replace(match):
+        alias = match.group(2)
+        if recording_annotation(alias) or normalized(alias) in {'lyrics', 'audio', 'video'}:
+            return match.group(0)
+        return alias
+    return re.sub(r"(?<!\w)([^\W\d_A-Za-z]+(?:\s+[^\W\d_A-Za-z]+)*)\s*[\[(]"
+                  r"([A-Za-z0-9][^()\[\]]*)[\])]", replace, text)
 
 
 def title_parts(text: str) -> tuple[str, str]:
-    text = canonical_title(text)
+    text = bilingual_title(text)
+    featured = []
+
+    def feature(match):
+        featured.append(match.group(1).strip())
+        return ' '
+
+    text = re.sub(r"(?i)\(\s*(?:feat\.?|ft\.?|featuring|with)\s+([^()]*)\)", feature, text)
+    text = re.sub(r"[\[(]([^()\[\]]+)[\])]",
+                  lambda match: ' ' if recording_annotation(match.group(1)) else match.group(0), text)
+    segments = re.split(r"\s+[-–—]\s+", text)
+    while len(segments) > 1 and recording_annotation(segments[-1]):
+        segments.pop()
+    text = canonical_title(' - '.join(segments))
     text = re.sub(r"(?:\s+(?:19|20)\d{2})?\s+remaster(?:\s+(?:19|20)\d{2})?$", "", text)
+    text = re.sub(r"\s+(?:japanese|korean|english|chinese) version$", '', text)
     parts = text.split(" feat ", 1)
-    return parts[0], parts[1] if len(parts) == 2 else ""
+    if len(parts) == 2:
+        featured.append(parts[1])
+    return parts[0].strip(), canonical_title(', '.join(featured))
 
 
 def credit_present(artist: str, credits: str) -> bool:
@@ -154,55 +209,168 @@ def credit_present(artist: str, credits: str) -> bool:
     return len(names) > 1 and all(f" {normalized(name)} " in credits for name in names)
 
 
-def match_result(item: dict, entry: dict) -> tuple[float | None, str]:
+def remix_label(text: str) -> bool:
+    """Identify explicit remix/alternate-mix labels for version matching."""
+    return bool(re.search(r"\b(?:re\s*mix(?:ed|es)?|rmx|bootleg|mash\s*up|rework(?:ed)?|"
+                          r"(?:club|dance|dj|extended|dub|festival)\s*mix)\b", normalized(text)))
+
+
+def remix_recording(entry: dict) -> bool:
+    for key in ("title", "track", "alt_title", "version", "tags"):
+        value = entry.get(key)
+        values = value if isinstance(value, (list, tuple)) else [value]
+        if any(remix_label(value) for value in values if isinstance(value, str)):
+            return True
+    return bool(entry.get("remixed_by") or entry.get("remix_artist"))
+
+
+def presentation_title(text: str) -> str:
+    """Remove presentation brackets; original recording labels remain checked."""
+    words = {"official", "unofficial", "audio", "video", "music", "lyric", "lyrics",
+             "letra", "letras", "paroles", "text", "visualizer", "visualiser", "hd", "hq",
+             "4k", "1080p", "fan", "made", "fanmade", "reupload", "reuploaded", "upload",
+             "full", "only", "lyrical", "m", "v"}
+
+    def replace(match):
+        label = normalized(match.group(1))
+        if (label and set(label.split()) <= words) or re.match(r"^(?:lyrics?|letras?|paroles) by\s+", label):
+            return " "
+        return match.group(0)
+
+    return re.sub(r"[\[(]([^\[\]()]+)[\])]", replace, text)
+
+
+def candidate_song_title(entry: dict, artists: list[str], featured: str) -> str:
+    """Separate artist/title order and recognized pipe-delimited branding."""
+    raw = text_value(entry.get('title'))
+    segments = raw.split('|')
+    branding = {normalized(text_value(entry.get(key))) for key in ('uploader', 'channel')}
+    if len(segments) > 1 and all(not presentation_title(f'({segment})').strip()
+                                or normalized(segment) in branding for segment in segments[1:]):
+        raw = segments[0]
+    parts = re.split(r"\s+[-–—]\s+", raw, maxsplit=1)
+    if len(parts) == 2:
+        if any(credit_present(artist, ' ' + normalized(parts[0]) + ' ') for artist in artists):
+            raw = parts[1]
+        else:
+            remainder = ' ' + canonical_title(presentation_title(parts[1])) + ' '
+            for artist in artists + ([featured] if featured else []):
+                for name in [artist] + re.split(r'[,;]', artist):
+                    remainder = remainder.replace(' ' + normalized(name.strip()) + ' ', ' ')
+            if not (set(remainder.split()) - {'feat', 'and', 'x'}):
+                raw = parts[0]
+    return presentation_title(raw)
+
+
+def match_result(item: dict, entry: dict, *, allow_missing_artists: bool = False) -> tuple[float | None, str]:
     """Handle formatting variations without accepting conflicting recordings."""
     title = canonical_title(text_value(item.get("track_name")))
     core_title, featured = title_parts(text_value(item.get("track_name")))
-    artists = artist_names(item.get("artist_name"))
+    artists = artist_names(item.get("spotify_artist_names")) or artist_names(item.get("artist_name"))
     candidate = canonical_title(text_value(entry.get("title")))
+    requested_remix = remix_label(title)
+    candidate_remix = remix_recording(entry)
+    if candidate_remix and not requested_remix:
+        return None, "remix"
+    if requested_remix and not candidate_remix:
+        return None, "remix_required"
     if not title or not artists or not candidate or entry.get("is_live"):
         return None, "missing_metadata_or_live_stream"
+    requested_languages = recording_languages(text_value(item.get('track_name')))
+    candidate_languages = recording_languages(text_value(entry.get('title')))
+    if candidate_languages != requested_languages:
+        return None, 'language_version'
     words = set(candidate.split())
-    if not core_title or f" {core_title} " not in f" {candidate} ":
+    expected_ms = pd.to_numeric(item.get("duration_ms"), errors="coerce")
+    actual = pd.to_numeric(entry.get("duration"), errors="coerce")
+    expected = expected_ms / 1000 if pd.notna(expected_ms) and expected_ms > 0 else np.nan
+    close_duration = (pd.notna(expected) and pd.notna(actual)
+                      and abs(actual - expected) <= max(3., expected * .02))
+    song_title = candidate_song_title(entry, artists, featured)
+    candidate_core, _ = title_parts(song_title)
+    if not core_title or f" {core_title} " not in f" {candidate_core} ":
         return None, "title"
-    credits = " " + " ".join([candidate] + [normalized(re.sub(r"(?i)vevo$", "", text_value(entry.get(k))))
-                                           for k in ("uploader", "channel", "artist")]) + " "
-    if not all(credit_present(artist, credits) for artist in artists) or (featured and not credit_present(featured, credits)):
+    if requested_remix:
+        # Featured-credit parsing can put a later remix suffix into the credit
+        # text. Require that suffix independently so duration relaxation cannot
+        # substitute a different named remix.
+        labels = re.split(r"[()\[\]]|\s+[-–—]\s+", text_value(item.get("track_name")))
+        for label in labels:
+            if remix_label(label) and f" {canonical_title(label)} " not in f" {candidate} ":
+                return None, "remix_version"
+        # A matching upload title must not conceal contradictory named-remix
+        # metadata. Bare base-song track names do not themselves contradict it.
+        for key in ("track", "alt_title", "version", "remixed_by", "remix_artist"):
+            value = entry.get(key)
+            values = value if isinstance(value, (list, tuple)) else [value]
+            for version in values:
+                if not isinstance(version, str) or not version.strip():
+                    continue
+                if key in ("remixed_by", "remix_artist"):
+                    if not credit_present(version, " " + title + " " + " ".join(artists) + " "):
+                        return None, "remix_version"
+                    continue
+                if not remix_label(version):
+                    continue
+                version = canonical_title(version)
+                if key == "version":
+                    if f" {version} " not in f" {title} ":
+                        return None, "remix_version"
+                elif (f" {core_title} " not in f" {version} "
+                      or any(remix_label(label) and f" {canonical_title(label)} " not in f" {version} "
+                             for label in labels)):
+                    return None, "remix_version"
+    credit_fields = []
+    for key in ("uploader", "channel", "artist", "artists", "creator", "creators"):
+        values = entry.get(key)
+        values = values if isinstance(values, (list, tuple)) else [values]
+        credit_fields.extend(normalized(re.sub(r"(?i)vevo$", "", value))
+                             for value in values if isinstance(value, str))
+    credits = " " + " ".join([candidate] + credit_fields) + " "
+    artist_missing = (not all(credit_present(artist, credits) for artist in artists)
+                      or bool(featured and not credit_present(featured, credits)))
+    primary_artist = re.split(r"[,;]", artists[0], maxsplit=1)[0].strip()
+    primary_present = credit_present(primary_artist, credits)
+    if artist_missing and not (primary_present and (allow_missing_artists or close_duration)):
         return None, "artist"
     # A wider search must not accept a different title merely containing the
     # requested phrase (e.g. "Another Example Song" for "Example Song").
-    raw_candidate = text_value(entry.get("title"))
-    parts = re.split(r"\s+[-–—]\s+", raw_candidate, maxsplit=1)
-    song_title = raw_candidate
-    if len(parts) == 2 and any(credit_present(artist, " " + normalized(parts[0]) + " ") for artist in artists):
-        song_title = parts[1]
-    candidate_core, _ = title_parts(song_title)
     if f" {core_title} " not in f" {candidate_core} ":
         return None, "title"
     remaining = f" {candidate_core} ".replace(f" {core_title} ", " ")
-    for artist in artists:
+    for artist in artists + ([featured] if featured else []):
         for name in [artist] + re.split(r"[,;]", artist):
             remaining = remaining.replace(f" {normalized(name.strip())} ", " ")
+    # Remove complete presentation phrases only after removing the requested
+    # title, so these words in a real song title retain their meaning.
+    remaining = re.sub(r"\b(?:audio only|full audio)\b", "audio", remaining)
+    remaining = re.sub(r"\boriginal mix\b", " ", remaining)
+    remaining = re.sub(r"\b(?:lyrics?|letras?|paroles) by\s+.*$", " ", remaining)
     noise = {"official", "audio", "video", "music", "lyric", "lyrics", "visualizer",
-             "visualiser", "hd", "hq", "4k", "1080p", "officialaudio", "officialvideo"}
+             "visualiser", "hd", "hq", "4k", "1080p", "officialaudio", "officialvideo",
+             "unofficial", "reupload", "reuploaded", "letra", "letras", "paroles", "fanmade"}
+    noise.update({'lyrical', 'm', 'v'})
     requested_labels = set(title.split()) - set(core_title.split())
     if set(remaining.split()) - noise - requested_labels:
         return None, "title"
-    versions = {"live", "cover", "remix", "acoustic", "karaoke", "instrumental",
-                "slowed", "sped", "nightcore", "remaster", "demo", "edit", "reverb"}
+    versions = {"live", "cover", "acoustic", "karaoke", "instrumental",
+                "slowed", "sped", "nightcore", "demo", "edit", "reverb", "stripped"}
     # Version terms belonging to the artist's name are not recording labels.
     requested = set(normalized(title + " " + " ".join(artists)).split())
     if (words & versions) - requested:
         return None, "version"
     if (set(title.split()) & versions) - words:
         return None, "version"
+    unverified_remaster = False
     if "remaster" in title.split():
         years = set(re.findall(r"\b(?:19|20)\d{2}\b", title))
-        if not years.issubset(words):
+        candidate_years = set(re.findall(r"\b(?:19|20)\d{2}\b", candidate))
+        if "remaster" in words and years and candidate_years and not years.issubset(candidate_years):
             return None, "remaster_year"
+        unverified_remaster = "remaster" not in words or not years.issubset(candidate_years)
+        if unverified_remaster and not close_duration:
+            return None, "remaster_unverified_duration"
     score = 1.0
-    expected_ms = pd.to_numeric(item.get("duration_ms"), errors="coerce")
-    actual = pd.to_numeric(entry.get("duration"), errors="coerce")
     if pd.notna(expected_ms) and expected_ms > 0 and pd.notna(actual):
         expected = expected_ms / 1000
         error = abs(actual - expected)
@@ -211,7 +379,17 @@ def match_result(item: dict, entry: dict) -> tuple[float | None, str]:
         score += 1 - error / max(12., expected * .12)
     if "topic" in normalized(text_value(entry.get("channel") or entry.get("uploader"))):
         score += .25
-    return score, "matched"
+    if artist_missing and allow_missing_artists:
+        # Provisional search candidate only: never publish/download on this score.
+        return score * .5, "needs_artist_metadata"
+    notes = []
+    if artist_missing:
+        notes.append("primary_artist_duration")
+        score *= .8
+    if unverified_remaster:
+        notes.append("unverified_remaster")
+        score *= .8
+    return score, "matched_" + "_".join(notes) if notes else "matched"
 
 
 def match_score(item: dict, entry: dict) -> float | None:
@@ -222,6 +400,12 @@ def acquisition_error_code(exc: Exception) -> str:
     message = str(exc).casefold()
     if message.startswith("resolved_recording_mismatch:"):
         return message
+    if re.search(r"(?:not available|blocked|not made.*available).*\b(?:country|region)\b", message):
+        return "geo_restricted"
+    if "page needs to be reloaded" in message:
+        return "session_reload_required"
+    if "signature solving failed" in message or "challenge solving failed" in message:
+        return "js_challenge_failed"
     for status in (429, 403):
         if re.search(rf"\b(?:http(?: error)?|status(?: code)?)\s*[:=]?\s*{status}\b", message):
             return f"http_{status}"
@@ -248,7 +432,7 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
     if not re.fullmatch(r"[A-Za-z0-9_-]+", tid):
         raise ValueError("invalid_track_id")
     title = text_value(item.get("track_name"))
-    artists = artist_names(item.get("artist_name"))
+    artists = artist_names(item.get("spotify_artist_names")) or artist_names(item.get("artist_name"))
     if not title or not artists:
         raise ValueError("missing_search_metadata")
     try:
@@ -266,11 +450,40 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
     options = {**common, "format": "bestaudio/best", "overwrites": False,
                "postprocessors": [{"key": "FFmpegExtractAudio", "preferredcodec": "wav"}]}
     core, _ = title_parts(title)
-    versions = " remaster" if "remaster" in canonical_title(title).split() else ""
+    requested_words = set(canonical_title(title).split())
+    recording_labels = sorted(recording_languages(title)) + [
+        label for label in ('live', 'stripped', 'acoustic', 'instrumental', 'karaoke', 'slowed', 'sped')
+        if label in requested_words]
+    versions = ''.join(' ' + label for label in recording_labels)
+    versions += " remaster" if "remaster" in requested_words else ""
     queries = [f"ytsearch5:{' '.join(artists)} {title} official audio",
                f"ytsearch10:{' '.join(artists)} {core}{versions}"]
+    primary_artist = re.split(r"[,;]", artists[0], maxsplit=1)[0].strip()
+    queries.append(f"ytsearch15:{primary_artist} {core}{versions}")
+    lyric_versions = ''.join(' ' + label for label in recording_labels)
+    queries.append(f"ytsearch15:{primary_artist} {core}{lyric_versions} lyrics")
     errors, search_errors, attempted = [], [], set()
     rejections = Counter()
+    rejection_examples, rejected_urls = [], set()
+
+    def reject(entry, reason):
+        url = text_value(entry.get("webpage_url") or entry.get("url"))
+        identity = (url or text_value(entry.get("title")), reason)
+        if identity in rejected_urls:
+            return
+        rejected_urls.add(identity)
+        rejections[reason] += 1
+        if len(rejection_examples) < 5:
+            # Do not log signed URLs, arbitrary query parameters or userinfo.
+            parsed = urlsplit(url)
+            query = ""
+            if parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com"):
+                video = parse_qs(parsed.query).get("v", [])
+                query = urlencode({"v": video[0]}) if video else ""
+            safe_url = urlunsplit((parsed.scheme, parsed.hostname or "", parsed.path, query, ""))
+            rejection_examples.append((reason, text_value(entry.get("title"))[:200],
+                                       text_value(entry.get("uploader") or entry.get("channel"))[:100],
+                                       safe_url[:300]))
     saw_results = False
     search_time = download_time = conversion_time = 0.
     for query in queries:
@@ -281,7 +494,7 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
         except yt_dlp.utils.DownloadError as exc:
             code = acquisition_error_code(exc)
             search_errors.append(code)
-            if code in ("http_429", "authentication_required"):
+            if code in DEFERRED_ACQUISITION_CODES:
                 raise RuntimeError("search_failed: " + code) from exc
             continue
         finally:
@@ -291,20 +504,19 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
             if not entry:
                 continue
             saw_results = True
-            score, reason = match_result(item, entry)
+            score, reason = match_result(item, entry, allow_missing_artists=True)
             url = entry.get("webpage_url") or entry.get("url")
             if score is not None and url and url not in attempted:
-                candidates.append((score, url, entry))
+                candidates.append((score, url, entry, reason))
             elif score is None:
-                rejections[reason] += 1
-        for _, url, entry in sorted(candidates, key=lambda pair: pair[0], reverse=True):
+                reject(entry, reason)
+        for _, url, entry, match_reason in sorted(candidates, key=lambda pair: pair[0], reverse=True):
             if url in attempted:
                 continue
             attempted.add(url)
             audio_dir.mkdir(parents=True, exist_ok=True)
             # Never resume one recording's partial download as another recording.
             # Retain failed staging files for inspection rather than deleting them.
-            staging = Path(tempfile.mkdtemp(prefix=f".{tid}_", dir=audio_dir))
             tick = perf_counter()
             conversion_started, converted = None, 0.
 
@@ -319,10 +531,20 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
                     conversion_started = None
 
             try:
+                if match_reason == "needs_artist_metadata":
+                    with youtube_session(options, cookiejar) as resolver:
+                        resolved = resolver.extract_info(url, download=False)
+                    entry = {**entry, **resolved}
+                    score, reason = match_result(item, entry)
+                    if score is None:
+                        reject(entry, reason)
+                        continue
+                staging = Path(tempfile.mkdtemp(prefix=f".{tid}_", dir=audio_dir))
                 with youtube_session({**options, "outtmpl": str(staging / f"{tid}.%(ext)s"),
                                       "postprocessor_hooks": [postprocess_hook]}, cookiejar) as downloader:
                     result = downloader.extract_info(url, download=True)
-                resolved_score, reason = match_result(item, {**entry, **result})
+                recording = {**entry, **result}
+                resolved_score, reason = match_result(item, recording)
                 if resolved_score is None:
                     raise RuntimeError("resolved_recording_mismatch: " + reason)
                 audio = staging / f"{tid}.wav"
@@ -330,17 +552,31 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
                     raise RuntimeError("download produced no converted WAV")
                 source = result.get("webpage_url") or url
                 sidecar = audio.with_suffix(".source.json")
-                sidecar.write_text(json.dumps({"url": source, "title": result.get("title"),
-                    "matching": "artist_title_version_duration_v2"}, ensure_ascii=False), encoding="utf-8")
+                identity_fields = ("title", "track", "alt_title", "version", "tags", "remixed_by",
+                                   "remix_artist", "artist", "artists", "creator", "creators",
+                                   "uploader", "channel", "duration", "is_live")
+                identity = {key: recording[key] for key in identity_fields if key in recording}
+                sidecar.write_text(json.dumps({**identity, "url": source,
+                    "matching": "structured_recording_identity_v6",
+                    "match_evidence": reason}, ensure_ascii=False), encoding="utf-8")
                 destination = audio_dir / f"{tid}.wav"
-                os.replace(sidecar, destination.with_suffix(".source.json"))
+                destination_sidecar = destination.with_suffix(".source.json")
+                if destination.exists() or destination_sidecar.exists():
+                    previous = Path(tempfile.mkdtemp(prefix=f".{tid}_previous_", dir=audio_dir))
+                    for existing in (destination, destination_sidecar):
+                        if existing.exists():
+                            shutil.copy2(existing, previous / existing.name)
+                    LOG.info("Preserved previous audio/provenance for %s at %s", tid, previous)
+                # Never pair old (possibly remix) audio with new clean provenance
+                # if replacing the audio itself is denied by Windows.
                 os.replace(audio, destination)
+                os.replace(sidecar, destination_sidecar)
                 return destination, source
             except Exception as exc:
                 code = acquisition_error_code(exc)
                 errors.append(code)
                 LOG.warning("Download candidate failed for %s (%s)", tid, code)
-                if code in ("http_429", "authentication_required"):
+                if code in DEFERRED_ACQUISITION_CODES:
                     raise RuntimeError("download_failed: " + code) from exc
             finally:
                 if conversion_started is not None:
@@ -350,6 +586,9 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
                 LOG.info("Acquisition %s: search %.2fs, resolve/download %.2fs, conversion %.2fs",
                          tid, search_time, download_time, conversion_time)
     LOG.warning("No acquired audio for %s; rejected candidates: %s", tid, dict(rejections))
+    for reason, candidate_title, uploader, url in rejection_examples:
+        LOG.warning("Rejected candidate for %s: reason=%s title=%r uploader=%r url=%s",
+                    tid, reason, candidate_title, uploader, url)
     if errors:
         raise RuntimeError("download_failed: " + ", ".join(sorted(set(errors))))
     if search_errors:
@@ -567,6 +806,22 @@ def save_batch(results: list[dict], master_path: Path,
         for col in master.columns:
             incoming[col] = incoming[col].astype(master[col].dtype)
         master = pd.concat([master, incoming])
+    # Backlog enrichment must survive successful extraction even when the track
+    # already exists in master; fill only gaps and preserve all existing text.
+    metadata_fields = ('duration_ms', 'isrc', 'spotify_track_name', 'spotify_artist_names',
+                       'spotify_resolved_id', 'spotify_metadata_source', 'spotify_metadata_checked_at')
+    for record in results:
+        for col in metadata_fields:
+            value = record.get(col)
+            if (value is None or pd.isna(value) or not str(value).strip()
+                    or (col == 'duration_ms' and str(value).strip().casefold() == 'nan')):
+                continue
+            if col not in master:
+                master[col] = pd.Series(pd.NA, index=master.index, dtype='string')
+            previous = master.at[record['track_id'], col]
+            if (pd.isna(previous) or not str(previous).strip()
+                    or (col == 'duration_ms' and str(previous).strip().casefold() == 'nan')):
+                master.at[record['track_id'], col] = str(value)
     # Allocate/cast columns once per checkpoint, not for every track.
     active = [col for col in FEATURE_COLUMNS if any(pd.notna(row.get(col, np.nan)) for row in results)]
     for col in active:
@@ -606,6 +861,21 @@ def prepare_track(item: dict, audio_dir: Path, local_only: bool,
     LOG.info("Processing %s", tid)
     try:
         audio = find_local_audio(tid, audio_dir)
+        if audio is not None:
+            sidecar = audio.with_suffix(".source.json")
+            if sidecar.is_file():
+                try:
+                    cached_metadata = json.loads(sidecar.read_text(encoding="utf-8"))
+                    if isinstance(cached_metadata, dict):
+                        requested_remix = remix_label(text_value(item.get("track_name")))
+                        incompatible = (match_result(item, cached_metadata)[0] is None if requested_remix
+                                        else remix_recording(cached_metadata))
+                        if incompatible:
+                            LOG.warning("Ignoring cached audio with incompatible remix metadata for %s; "
+                                        "original file retained", tid)
+                            audio = None
+                except (OSError, ValueError, TypeError):
+                    pass  # audio_source reports malformed provenance as before.
         source = audio_source(audio) if audio else None
         if audio is None and not local_only and not dry_run:
             auth = {"cookiejar": cookiejar} if cookiejar is not None else {}
@@ -683,7 +953,10 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
     signatures = {path: file_signature(path) for path in (master_path, backlog_path)}
     master = read_master(master_path)
     backlog = read_backlog(backlog_path)
-    eligible = (backlog if retry_failed else backlog[backlog["attempts"] < max_attempts]).copy()
+    eligible = (backlog if retry_failed else backlog[(backlog["attempts"] < max_attempts)
+                                                    | (backlog["last_error"] == "excluded_remix")]).copy()
+    if retry_failed:
+        eligible = eligible.sort_values("attempts", kind="stable")
     if limit is not None:
         eligible = eligible.head(limit)
     stats = {"eligible": len(eligible), "saved": 0, "failed": 0}
@@ -693,7 +966,7 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
     acquire_time = analyze_time = checkpoint_time = 0.
     error_counts = Counter()
     checkpoint_started = False
-    authentication_challenges = deferred_total = 0
+    service_challenges = deferred_total = 0
     acquisition_blocked = False
 
     def checkpoint():
@@ -784,12 +1057,13 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
                     if not error:
                         ready.append(prepared)
                         continue
-                    if ("authentication_required" in error or "http_429" in error):
+                    service_code = next((code for code in DEFERRED_ACQUISITION_CODES if code in error), None)
+                    if service_code:
                         deferred[tid] = error
                         deferred_total += 1
                         error_counts[error] += 1
-                        authentication_challenges += int("authentication_required" in error)
-                        if not acquisition_blocked and ("http_429" in error or authentication_challenges >= 3):
+                        service_challenges += int(service_code != "http_429")
+                        if not acquisition_blocked and (service_code == "http_429" or service_challenges >= 3):
                             acquisition_blocked = True
                             LOG.warning("Acquisition paused for this run after service challenges. "
                                         "Finishing in-flight work; blocked and unstarted tracks keep "

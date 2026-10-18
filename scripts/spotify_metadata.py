@@ -4,6 +4,7 @@ import os
 import re
 import tempfile
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -18,6 +19,111 @@ TRACK_FIELDS = (
 )
 EXTRA_FIELDS = ('label', 'artist_genres')
 NUMERIC_FIELDS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity'}
+
+
+def backfill_backlog(backlog_path, client_factory, save, *, sp=None, dry_run=False,
+                     limit=None, checkpoint_size=25):
+    """Fill backlog metadata directly, independent of membership in the master.
+
+    Persist every checkpoint_size requests and on an interrupted/error exit.
+    Reruns select missing required metadata, so completed rows need no request.
+    Other CSV writers must be stopped; the signature guard detects conflicts.
+    """
+    path = Path(backlog_path)
+    if (limit is not None and limit <= 0) or checkpoint_size <= 0:
+        raise ValueError('limit and checkpoint_size must be positive')
+    signature = lambda: (path.stat().st_mtime_ns, path.stat().st_size)
+    original = signature()
+    df = pd.read_csv(path, dtype='string', keep_default_na=False)
+    if 'track_id' not in df or df['track_id'].str.strip().eq('').any() or df['track_id'].duplicated().any():
+        raise ValueError('Backlog needs unique nonempty track_id values')
+    required = ('duration_ms', 'spotify_track_name', 'spotify_artist_names')
+    eligible = [index for index, row in df.iterrows()
+                if any(missing(row.get(field), field) for field in required)]
+    stats = {'eligible': len(eligible), 'fetched': 0, 'updated_cells': 0,
+             'unavailable': 0, 'invalid_ids': 0, 'failed': 0}
+    print(f'{len(eligible)} backlog tracks need recording metadata.')
+    if dry_run:
+        print('DRY RUN: no authentication, requests, or writes.')
+        return stats
+    dirty = False
+
+    def put(index, field, value, *, replace=False):
+        nonlocal dirty
+        if missing(value, field):
+            return
+        if field not in df:
+            df[field] = pd.Series('', index=df.index, dtype='string')
+        if (replace or missing(df.at[index, field], field)) and str(df.at[index, field]) != str(value):
+            df.at[index, field] = str(value)
+            stats['updated_cells'] += 1
+            dirty = True
+
+    def checkpoint():
+        nonlocal original, dirty
+        if not dirty:
+            return
+        if signature() != original:
+            raise RuntimeError('Backlog changed during metadata fetching; stop other writers')
+        save(df, path)
+        original = signature()
+        dirty = False
+
+    checked = 0
+    try:
+        for index in eligible:
+            if checked and checked % checkpoint_size == 0:
+                checkpoint()
+            if limit is not None and checked >= limit:
+                break
+            tid = str(df.at[index, 'track_id'])
+            if not re.fullmatch(r'[A-Za-z0-9]{22}', tid):
+                stats['invalid_ids'] += 1
+                put(index, 'spotify_metadata_error', 'invalid_id', replace=True)
+                continue
+            if sp is None:
+                sp = client_factory()
+            checked += 1
+            try:
+                track = request(lambda: sp.track(tid))
+            except SpotifyException as exc:
+                if exc.http_status in (401, 403):
+                    raise
+                stats['unavailable' if exc.http_status == 404 else 'failed'] += 1
+                put(index, 'spotify_metadata_error', f'http_{exc.http_status}', replace=True)
+                continue
+            except RequestException:
+                stats['failed'] += 1
+                put(index, 'spotify_metadata_error', 'request_failed', replace=True)
+                continue
+            if not track or not track.get('id'):
+                stats['unavailable'] += 1
+                put(index, 'spotify_metadata_error', 'unavailable', replace=True)
+                continue
+            if track['id'] != tid and (track.get('linked_from') or {}).get('id') != tid:
+                stats['failed'] += 1
+                put(index, 'spotify_metadata_error', 'recording_identity_mismatch', replace=True)
+                continue
+            metadata = track_metadata(track)
+            names = [artist['name'] for artist in (track.get('artists') or []) if artist.get('name')]
+            incoming = {'duration_ms': metadata.get('duration_ms'), 'isrc': metadata.get('isrc'),
+                        'spotify_track_name': metadata.get('track_name'),
+                        'spotify_artist_names': json.dumps(names, ensure_ascii=False) if names else None,
+                        'track_name': metadata.get('track_name'), 'artist_name': metadata.get('artist_name'),
+                        'spotify_resolved_id': track['id'], 'spotify_metadata_source': 'spotify_track_api',
+                        'spotify_metadata_checked_at': datetime.now(timezone.utc).isoformat()}
+            for field, value in incoming.items():
+                put(index, field, value)
+            if 'spotify_metadata_error' in df and df.at[index, 'spotify_metadata_error']:
+                df.at[index, 'spotify_metadata_error'] = ''
+                dirty = True
+            stats['fetched'] += 1
+            if checked % checkpoint_size == 0:
+                checkpoint()
+    finally:
+        checkpoint()
+    print(f"Fetched {stats['fetched']} backlog records; filled {stats['updated_cells']} cells.")
+    return stats
 
 
 def missing(value, field=''):
