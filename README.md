@@ -301,6 +301,20 @@ ID. A timestamp/size conflict check aborts rather than overwriting a detected
 external update; concurrent backlog writers remain unsupported. Dry-run reads
 only: no authentication, API requests or writes.
 
+Metadata requests pause for one second after each successful response. Short
+Spotify 429 cooldowns (up to 60 seconds) are respected with bounded retries.
+Longer cooldowns, absent/invalid `Retry-After` values, or exhausted 429 retries
+stop the entire job instead of continuing through tracks. Completed backlog
+updates or master metadata checkpoints are saved first; rate limits do not spend
+audio-extraction attempts. The command exits with code 2 and displays the next
+UTC retry time when available. The HTTP session preserves original 429 headers
+so Spotipy cannot discard them in a `Max Retries` exception. This shared handling
+also applies to master metadata backfill. Rerun the same command only after the
+reported cooldown; the command does not schedule a restart or shorten Spotify's
+restriction. If the retry time is unknown, avoid repeated immediate restarts.
+`--sync` also stops on cooldown and saves successfully fetched records into
+missing master cells before exiting.
+
 After enrichment, test extraction with your usual cookie option plus
 `--retry-failed --limit 20 --acquisition-workers 1`. Filling metadata does not
 reset the extraction attempt limit. Inspect rejected-candidate examples before

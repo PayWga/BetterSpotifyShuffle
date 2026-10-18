@@ -1,15 +1,18 @@
 """Missing-only catalog enrichment; independent of audio extraction dependencies."""
 import json
+import math
 import os
 import re
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pandas as pd
+import requests
 from requests.exceptions import RequestException
 from spotipy.exceptions import SpotifyException
+from urllib3.util.retry import Retry
 
 
 TRACK_FIELDS = (
@@ -19,6 +22,46 @@ TRACK_FIELDS = (
 )
 EXTRA_FIELDS = ('label', 'artist_genres')
 NUMERIC_FIELDS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity'}
+REQUEST_INTERVAL = 1.0
+MAX_INLINE_COOLDOWN = 60
+
+
+class SpotifyCooldown(RuntimeError):
+    """Job-wide stop: callers must not treat a 429 as a failed track."""
+
+    def __init__(self, retry_after=None):
+        self.retry_after = retry_after
+        self.retry_at = None
+        if retry_after is not None:
+            try:
+                self.retry_at = datetime.now(timezone.utc) + timedelta(seconds=retry_after)
+            except OverflowError:
+                pass
+        if self.retry_at is not None:
+            detail = (f'Retry no earlier than {self.retry_at:%Y-%m-%d %H:%M:%S} UTC '
+                      f'(after {retry_after:g} seconds).')
+        else:
+            detail = 'No usable retry time was supplied; do not immediately restart requests.'
+        super().__init__(f'Spotify rate limit: metadata run stopped. {detail}')
+
+
+def metadata_session():
+    """Return 429 responses intact instead of urllib3's headerless RetryError."""
+    session = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False))
+    session.mount('https://', adapter)
+    session.mount('http://', adapter)
+    return session
+
+
+def retry_delay(headers):
+    raw = next((value for key, value in (headers or {}).items()
+                if key.casefold() == 'retry-after'), None)
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return delay if math.isfinite(delay) and delay >= 0 else None
 
 
 def backfill_backlog(backlog_path, client_factory, save, *, sp=None, dry_run=False,
@@ -178,12 +221,20 @@ def request(call):
     for attempt in range(4):
         try:
             result = call()
-            time.sleep(0.1)
+            time.sleep(REQUEST_INTERVAL)
             return result
         except SpotifyException as exc:
-            if attempt == 3 or (exc.http_status != 429 and exc.http_status < 500):
+            if exc.http_status == 429:
+                delay = retry_delay(exc.headers)
+                if delay is None or delay > MAX_INLINE_COOLDOWN or attempt == 3:
+                    raise SpotifyCooldown(delay) from exc
+            elif attempt == 3 or exc.http_status < 500:
                 raise
-            delay = float((exc.headers or {}).get('Retry-After', 2 ** attempt))
+            else:
+                delay = retry_delay(exc.headers)
+                delay = 2 ** attempt if delay is None else delay
+                if delay > MAX_INLINE_COOLDOWN:
+                    raise
         except RequestException:
             if attempt == 3:
                 raise

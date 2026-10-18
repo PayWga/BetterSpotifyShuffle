@@ -341,7 +341,18 @@ def get_spotify_client():
         client_id=creds['client_id'], client_secret=creds['client_secret'],
         redirect_uri=creds['redirect_uri'], scope=SCOPE,
         cache_handler=CacheFileHandler(cache_path=str(PRIVATE_DIR / '.spotify_cache')),
-    ), retries=0, status_retries=0, requests_timeout=30)
+    ), requests_session=spotify_metadata.metadata_session(),
+        retries=0, status_retries=0, requests_timeout=30)
+
+
+def run_metadata_action(action, *args, **kwargs):
+    """Keep rate-limit exits readable after the action's checkpoint has run."""
+    try:
+        return action(*args, **kwargs)
+    except spotify_metadata.SpotifyCooldown as exc:
+        print(str(exc))
+        print('Completed checkpoints are retained. Rerun the same command after the cooldown.')
+        raise SystemExit(2) from None
 
 
 def backfill_metadata(master_path=None, checkpoint=None, **options):
@@ -452,6 +463,14 @@ def sync_metadata():
     import re
     records = {}
     sp = get_spotify_client()
+
+    def save_records():
+        if records:
+            # Reload before filling gaps to preserve updates made during fetching.
+            current = spotify_metadata.read_catalog(MASTER_DB)
+            spotify_metadata.fill_records(current, records, spotify_metadata.TRACK_FIELDS, allow_new=True)
+            save_database(current.reset_index())
+
     for tid in missing_ids:
         if not re.fullmatch(r'[A-Za-z0-9]{22}', tid):
             continue
@@ -459,6 +478,9 @@ def sync_metadata():
             record = spotify_metadata.fetch_track(sp, tid)
             if record:
                 records[tid] = record
+        except spotify_metadata.SpotifyCooldown:
+            save_records()
+            raise
         except spotipy.SpotifyException as exc:
             if exc.http_status in (401, 403):
                 raise
@@ -468,10 +490,7 @@ def sync_metadata():
     if not records:
         print("No metadata was retrieved.")
         return
-    # Read again before writing to preserve updates made during fetching.
-    master = spotify_metadata.read_catalog(MASTER_DB)
-    spotify_metadata.fill_records(master, records, spotify_metadata.TRACK_FIELDS, allow_new=True)
-    save_database(master.reset_index())
+    save_records()
     print(f"SUCCESS: Retrieved metadata for {len(records)} tracks.")
 
 
@@ -545,13 +564,13 @@ if __name__ == "__main__":
     elif args.merge:
         merge_csv(args.merge)
     elif args.sync:
-        sync_metadata()
+        run_metadata_action(sync_metadata)
     elif args.backfill:
-        backfill_metadata(args.master, args.checkpoint, dry_run=args.dry_run,
+        run_metadata_action(backfill_metadata, args.master, args.checkpoint, dry_run=args.dry_run,
                           fetch_only=args.fetch_only, limit=args.limit,
                           fields=args.fields, extra_metadata=args.extra_metadata)
     elif args.backfill_backlog:
-        backfill_backlog_metadata(args.backlog, dry_run=args.dry_run, limit=args.limit)
+        run_metadata_action(backfill_backlog_metadata, args.backlog, dry_run=args.dry_run, limit=args.limit)
     elif args.apply_backfill:
         apply_metadata_checkpoint(args.master, args.checkpoint, args.dry_run)
     elif args.repair:
