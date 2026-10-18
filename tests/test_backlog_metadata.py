@@ -6,6 +6,8 @@ from spotipy.exceptions import SpotifyException
 
 from scripts import data_merging as dm
 
+pytestmark = pytest.mark.usefixtures('metadata_clock')
+
 A, B = 'A' * 22, 'B' * 22
 
 

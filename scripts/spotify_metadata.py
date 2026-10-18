@@ -4,6 +4,7 @@ import math
 import os
 import re
 import tempfile
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,8 +23,10 @@ TRACK_FIELDS = (
 )
 EXTRA_FIELDS = ('label', 'artist_genres')
 NUMERIC_FIELDS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity'}
-REQUEST_INTERVAL = 1.0
+REQUEST_INTERVAL = 2.0
 MAX_INLINE_COOLDOWN = 60
+_request_lock = threading.Lock()
+_last_request_started = None
 
 
 class SpotifyCooldown(RuntimeError):
@@ -217,12 +220,21 @@ def track_metadata(track):
 
 
 def request(call):
-    """Retry transient failures; do not hide authentication/permission failures."""
+    """Pace every attempt process-wide, then apply bounded transient retries.
+
+    Use a monotonic clock so wall-clock changes cannot shorten the interval.
+    The same gate covers all metadata endpoints, failures, and retries.
+    """
+    global _last_request_started
     for attempt in range(4):
         try:
-            result = call()
-            time.sleep(REQUEST_INTERVAL)
-            return result
+            with _request_lock:
+                if _last_request_started is not None:
+                    remaining = REQUEST_INTERVAL - (time.monotonic() - _last_request_started)
+                    if remaining > 0:
+                        time.sleep(remaining)
+                _last_request_started = time.monotonic()
+                return call()
         except SpotifyException as exc:
             if exc.http_status == 429:
                 delay = retry_delay(exc.headers)

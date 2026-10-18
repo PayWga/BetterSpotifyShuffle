@@ -301,7 +301,14 @@ ID. A timestamp/size conflict check aborts rather than overwriting a detected
 external update; concurrent backlog writers remain unsupported. Dry-run reads
 only: no authentication, API requests or writes.
 
-Metadata requests pause for one second after each successful response. Short
+Metadata request attempts start at least two seconds apart (roughly 30 requests
+per minute per process), including failed lookups and every retry. A shared
+monotonic-clock gate covers track, album, and artist requests in master backfill,
+backlog backfill, and sync. Slow responses count toward that interval, so no
+extra delay is added when a request already took two seconds or longer. Separate
+processes and playback polling do not share this limiter; run one metadata job
+at a time. This is a local precaution, not a guarantee against Spotify's
+app-wide limits. Short
 Spotify 429 cooldowns (up to 60 seconds) are respected with bounded retries.
 Longer cooldowns, absent/invalid `Retry-After` values, or exhausted 429 retries
 stop the entire job instead of continuing through tracks. Completed backlog

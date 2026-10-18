@@ -1,5 +1,6 @@
 """Rate limits stop the whole metadata job without spending track attempts."""
 import json
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -12,7 +13,13 @@ from scripts import spotify_metadata as sm
 @pytest.fixture(autouse=True)
 def no_wait(monkeypatch):
     waits = []
-    monkeypatch.setattr(sm.time, 'sleep', waits.append)
+    now = [0.0]
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+    monkeypatch.setattr(sm, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    # Reset process pacing between independent tests without touching live state.
+    monkeypatch.setattr(sm, '_last_request_started', None, raising=False)
     return waits
 
 
@@ -42,7 +49,7 @@ def test_short_limit_waits_then_returns_with_conservative_pacing(no_wait):
             raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '2'})
         return 'ok'
     assert sm.request(fetch) == 'ok'
-    assert no_wait == [2, 1]
+    assert no_wait == [2]
 
 
 def test_repeated_short_limits_stop_instead_of_moving_to_next_track(no_wait):
@@ -165,3 +172,63 @@ def test_sync_preserves_successes_before_cooldown(tmp_path, monkeypatch):
     assert ids[1] not in rows.index
     assert rows.loc['existing', 'tempo'] == '120'
     assert sp.calls == ids[:2]
+
+
+def test_successful_requests_are_spaced_before_each_attempt(no_wait):
+    starts = []
+    for _ in range(3):
+        sm.request(lambda: starts.append(sm.time.monotonic()))
+    assert starts == [0, 2, 4]
+
+
+def test_not_found_requests_do_not_bypass_pacing(no_wait):
+    starts = []
+    def missing():
+        starts.append(sm.time.monotonic())
+        raise SpotifyException(404, -1, 'missing')
+    for _ in range(3):
+        with pytest.raises(SpotifyException):
+            sm.request(missing)
+    assert starts == [0, 2, 4]
+
+
+@pytest.mark.parametrize('failure', ['server', 'network', 'short_cooldown'])
+def test_retries_obey_minimum_spacing(no_wait, failure):
+    from requests.exceptions import Timeout
+    starts = []
+    def fetch():
+        starts.append(sm.time.monotonic())
+        if len(starts) == 1:
+            if failure == 'network':
+                raise Timeout('synthetic')
+            status = 429 if failure == 'short_cooldown' else 503
+            raise SpotifyException(status, -1, 'synthetic', headers={'Retry-After': '0'})
+        return 'ok'
+    assert sm.request(fetch) == 'ok'
+    assert starts == [0, 2]
+
+
+def test_slow_request_does_not_add_unnecessary_wait(no_wait):
+    starts = []
+    def slow():
+        starts.append(sm.time.monotonic())
+        sm.time.sleep(3)
+    sm.request(slow)
+    sm.request(lambda: starts.append(sm.time.monotonic()))
+    assert starts == [0, 3]
+
+
+def test_track_album_and_artist_share_request_pacing(no_wait):
+    starts = []
+    class Spotify:
+        def track(self, tid):
+            starts.append(sm.time.monotonic())
+            return {'id': tid, 'album': {'id': 'album'}, 'artists': [{'id': 'artist'}]}
+        def album(self, aid):
+            starts.append(sm.time.monotonic())
+            return {'label': 'Label'}
+        def artist(self, aid):
+            starts.append(sm.time.monotonic())
+            return {'genres': ['rock']}
+    assert sm.fetch_track(Spotify(), 'A' * 22, extra_metadata=True)['label'] == 'Label'
+    assert starts == [0, 2, 4]
