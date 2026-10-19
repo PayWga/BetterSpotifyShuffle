@@ -94,6 +94,55 @@ def test_local_aliases_and_year_are_filled_without_network(tmp_path):
     assert read(path).loc[A, 'year'] == '1999'
 
 
+def test_fetch_only_queues_only_api_tracks_and_limit_counts_lookups(tmp_path, monkeypatch):
+    from scripts import spotify_metadata as sm
+    path, checkpoint = tmp_path / 'master.csv', tmp_path / 'state.json'
+    path.write_text('id,name,artists,album,release_date,year,duration_ms,explicit\n'
+                    f'{A},Title,Artist,Album,1999,,120000,False\n'
+                    f'{B},Title,,,,,120000,False\n'
+                    'invalid,Title,,,,,120000,False\n')
+    before = path.read_bytes()
+    def forbidden_iterrows(self):
+        pytest.fail('Queue building must not iterate catalog rows in Python')
+    monkeypatch.setattr(pd.DataFrame, 'iterrows', forbidden_iterrows)
+    sp = Spotify()
+    stats = dm.backfill_metadata(path, checkpoint, sp=sp, fetch_only=True, limit=1,
+                                 fields=['track_name', 'artist_name', 'album_name', 'year'])
+    assert stats['eligible'] == 1
+    assert stats['local_only'] == 1
+    assert stats['invalid_ids'] == 1
+    assert sp.calls == [B]
+    assert set(json.loads(checkpoint.read_text())['records']) == {B}
+    assert path.read_bytes() == before
+
+
+def test_fetch_only_dry_run_reports_api_queue_after_checkpoint_skips(tmp_path):
+    path, checkpoint = tmp_path / 'master.csv', tmp_path / 'state.json'
+    path.write_text(f'id,name,artists\n{A},Title,Artist\n{B},Title,\n')
+    options = {'fetch_only': True, 'fields': ['artist_name']}
+    sp = Spotify()
+    stats = dm.backfill_metadata(path, checkpoint, sp=sp, **options)
+    assert stats['eligible'] == 1
+    before = checkpoint.read_bytes()
+    stats = dm.backfill_metadata(path, checkpoint, dry_run=True, **options)
+    assert stats['eligible'] == 0
+    assert stats['resumed'] == 1
+    assert checkpoint.read_bytes() == before
+
+
+def test_fetch_only_with_only_local_fills_never_authenticates(tmp_path, monkeypatch):
+    path, checkpoint = tmp_path / 'master.csv', tmp_path / 'state.json'
+    path.write_text(f'id,name,artists,release_date\n{A},Title,Artist,1999\n')
+    def forbidden():
+        pytest.fail('Local-only rows must not authenticate')
+    monkeypatch.setattr(dm, 'get_spotify_client', forbidden)
+    stats = dm.backfill_metadata(path, checkpoint, fetch_only=True,
+                                 fields=['artist_name', 'year'])
+    assert stats['eligible'] == 0
+    assert stats['local_only'] == 1
+    assert json.loads(checkpoint.read_text())['records'] == {}
+
+
 def test_unavailable_and_invalid_ids_are_reported(catalog, tmp_path):
     class Missing(Spotify):
         def track(self, tid):
@@ -106,7 +155,7 @@ def test_unavailable_and_invalid_ids_are_reported(catalog, tmp_path):
     assert read(catalog).loc[A, 'artist_name'] == ''
 
 
-def test_rate_limit_retries_but_auth_error_stops(catalog, tmp_path, monkeypatch):
+def test_rate_limit_and_auth_error_stop(catalog, tmp_path, monkeypatch):
     from scripts import spotify_metadata as sm
     sleeps = []
     monkeypatch.setattr(sm.time, 'sleep', sleeps.append)
@@ -116,8 +165,9 @@ def test_rate_limit_retries_but_auth_error_stops(catalog, tmp_path, monkeypatch)
                 self.calls.append('limited')
                 raise SpotifyException(429, -1, 'rate limit', headers={'Retry-After': '2'})
             return super().track(tid)
-    dm.backfill_metadata(catalog, tmp_path / 'state.json', sp=Limited(), fetch_only=True)
-    assert 2 in sleeps
+    with pytest.raises(sm.SpotifyCooldown):
+        dm.backfill_metadata(catalog, tmp_path / 'state.json', sp=Limited(), fetch_only=True)
+    assert not sleeps
     class Denied(Spotify):
         def track(self, tid):
             raise SpotifyException(403, -1, 'denied')

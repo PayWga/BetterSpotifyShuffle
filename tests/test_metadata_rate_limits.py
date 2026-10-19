@@ -41,15 +41,17 @@ def test_long_or_unknown_limit_stops_without_retry(header, no_wait):
         assert caught.value.retry_at is None
 
 
-def test_short_limit_waits_then_returns_with_conservative_pacing(no_wait):
+def test_short_limit_stops_immediately_without_probe_retry(no_wait):
     calls = []
     def fetch():
         calls.append(1)
         if len(calls) == 1:
             raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '2'})
         return 'ok'
-    assert sm.request(fetch) == 'ok'
-    assert no_wait == [2]
+    with pytest.raises(sm.SpotifyCooldown):
+        sm.request(fetch)
+    assert len(calls) == 1
+    assert no_wait == []
 
 
 def test_repeated_short_limits_stop_instead_of_moving_to_next_track(no_wait):
@@ -59,8 +61,8 @@ def test_repeated_short_limits_stop_instead_of_moving_to_next_track(no_wait):
         raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '2'})
     with pytest.raises(sm.SpotifyCooldown):
         sm.request(limited)
-    assert len(calls) == 4
-    assert no_wait == [2, 2, 2]
+    assert len(calls) == 1
+    assert no_wait == []
 
 
 @pytest.mark.parametrize('kind', ['backlog', 'master'])
@@ -178,7 +180,7 @@ def test_successful_requests_are_spaced_before_each_attempt(no_wait):
     starts = []
     for _ in range(3):
         sm.request(lambda: starts.append(sm.time.monotonic()))
-    assert starts == [0, 2, 4]
+    assert starts == [0, 10, 20]
 
 
 def test_not_found_requests_do_not_bypass_pacing(no_wait):
@@ -189,10 +191,10 @@ def test_not_found_requests_do_not_bypass_pacing(no_wait):
     for _ in range(3):
         with pytest.raises(SpotifyException):
             sm.request(missing)
-    assert starts == [0, 2, 4]
+    assert starts == [0, 10, 20]
 
 
-@pytest.mark.parametrize('failure', ['server', 'network', 'short_cooldown'])
+@pytest.mark.parametrize('failure', ['server', 'network'])
 def test_retries_obey_minimum_spacing(no_wait, failure):
     from requests.exceptions import Timeout
     starts = []
@@ -201,21 +203,20 @@ def test_retries_obey_minimum_spacing(no_wait, failure):
         if len(starts) == 1:
             if failure == 'network':
                 raise Timeout('synthetic')
-            status = 429 if failure == 'short_cooldown' else 503
-            raise SpotifyException(status, -1, 'synthetic', headers={'Retry-After': '0'})
+            raise SpotifyException(503, -1, 'synthetic', headers={'Retry-After': '0'})
         return 'ok'
     assert sm.request(fetch) == 'ok'
-    assert starts == [0, 2]
+    assert starts == [0, 10]
 
 
 def test_slow_request_does_not_add_unnecessary_wait(no_wait):
     starts = []
     def slow():
         starts.append(sm.time.monotonic())
-        sm.time.sleep(3)
+        sm.time.sleep(12)
     sm.request(slow)
     sm.request(lambda: starts.append(sm.time.monotonic()))
-    assert starts == [0, 3]
+    assert starts == [0, 12]
 
 
 def test_track_album_and_artist_share_request_pacing(no_wait):
@@ -231,4 +232,4 @@ def test_track_album_and_artist_share_request_pacing(no_wait):
             starts.append(sm.time.monotonic())
             return {'genres': ['rock']}
     assert sm.fetch_track(Spotify(), 'A' * 22, extra_metadata=True)['label'] == 'Label'
-    assert starts == [0, 2, 4]
+    assert starts == [0, 10, 20]

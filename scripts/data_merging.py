@@ -13,8 +13,10 @@ from spotipy.cache_handler import CacheFileHandler
 
 if __package__:
     from . import spotify_metadata
+    from . import local_backfill
 else:
     import spotify_metadata
+    import local_backfill
 
 # Paths: assumes this file is in the project's scripts/ directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -333,15 +335,26 @@ def save_database(df, path=None):
             temp_path.unlink()
 
 
+def get_metadata_guard():
+    return spotify_metadata.SpotifyRequestBudget(
+        PRIVATE_DIR / 'spotify_request_budget.json',
+        interval=spotify_metadata.REQUEST_INTERVAL,
+        rest_every=spotify_metadata.REQUEST_REST_EVERY,
+        rest_seconds=spotify_metadata.REQUEST_REST_SECONDS,
+    )
+
+
 def get_spotify_client():
     """Use the same private credentials/cache as the project's playback tools."""
+    budget = get_metadata_guard()
+    budget.check_allowed()
     with (PRIVATE_DIR / 'spotify_credentials.json').open(encoding='utf-8') as source:
         creds = json.load(source)
     return spotipy.Spotify(auth_manager=SpotifyOAuth(
         client_id=creds['client_id'], client_secret=creds['client_secret'],
         redirect_uri=creds['redirect_uri'], scope=SCOPE,
         cache_handler=CacheFileHandler(cache_path=str(PRIVATE_DIR / '.spotify_cache')),
-    ), requests_session=spotify_metadata.metadata_session(),
+    ), requests_session=spotify_metadata.metadata_session(budget),
         retries=0, status_retries=0, requests_timeout=30)
 
 
@@ -349,10 +362,16 @@ def run_metadata_action(action, *args, **kwargs):
     """Keep rate-limit exits readable after the action's checkpoint has run."""
     try:
         return action(*args, **kwargs)
-    except spotify_metadata.SpotifyCooldown as exc:
+    except spotify_metadata.SpotifyBudgetBlocked as exc:
         print(str(exc))
         print('Completed checkpoints are retained. Rerun the same command after the cooldown.')
         raise SystemExit(2) from None
+
+
+def backfill_local_metadata(master_path=None, source_root=None, dry_run=False):
+    return local_backfill.run(MASTER_DB if master_path is None else master_path,
+                              PROJECT_ROOT if source_root is None else source_root,
+                              save_database, dry_run)
 
 
 def backfill_metadata(master_path=None, checkpoint=None, **options):
@@ -478,7 +497,7 @@ def sync_metadata():
             record = spotify_metadata.fetch_track(sp, tid)
             if record:
                 records[tid] = record
-        except spotify_metadata.SpotifyCooldown:
+        except spotify_metadata.SpotifyBudgetBlocked:
             save_records()
             raise
         except spotipy.SpotifyException as exc:
@@ -529,11 +548,15 @@ if __name__ == "__main__":
     actions.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
     actions.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
     actions.add_argument("--backfill", action="store_true", help="Fill missing Spotify metadata for existing master tracks")
+    actions.add_argument("--backfill-local", action="store_true", help="Fill missing master metadata from local aliases, history, and saved Spotify data; no API calls")
     actions.add_argument("--backfill-backlog", action="store_true", help="Fill missing duration/recording metadata directly in the audio backlog")
     actions.add_argument("--apply-backfill", action="store_true", help="Apply a metadata checkpoint after other catalog writers stop")
     actions.add_argument("--repair", action="store_true", help="Clean identifiers, duplicates, and invalid feature values")
     actions.add_argument("--clear-placeholders", action="store_true", help="Convert exact -1 sentinels in known nonnegative columns to NaN")
+    actions.add_argument("--spotify-budget-status", action="store_true", help="Show local request-budget/cooldown status without calling Spotify")
+    actions.add_argument("--set-spotify-cooldown", type=float, metavar="SECONDS", help="Persist a known cooldown without making API calls; never shortens an existing pause")
     parser.add_argument("--master", type=Path, help="Master CSV for placeholder cleanup or metadata backfill")
+    parser.add_argument("--local-source-root", type=Path, help="Project root containing data/ and sensitive_info/ for --backfill-local")
     parser.add_argument("--backlog", type=Path, help="Backlog CSV for --backfill-backlog")
     parser.add_argument("--dry-run", action="store_true", help="Preview cleanup/backfill/apply without writing or API requests")
     parser.add_argument("--checkpoint", type=Path, help="Resumable metadata JSON (default: beside the selected master)")
@@ -544,9 +567,11 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     enrichment = args.backfill or args.apply_backfill
-    if args.master is not None and not (args.clear_placeholders or enrichment):
+    if args.local_source_root is not None and not args.backfill_local:
+        parser.error('--local-source-root requires --backfill-local')
+    if args.master is not None and not (args.clear_placeholders or enrichment or args.backfill_local):
         parser.error("--master and --dry-run require --clear-placeholders, --backfill, or --apply-backfill")
-    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog):
+    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog or args.backfill_local):
         parser.error("--dry-run requires a cleanup or metadata action")
     if args.backlog is not None and not args.backfill_backlog:
         parser.error("--backlog requires --backfill-backlog")
@@ -559,7 +584,13 @@ if __name__ == "__main__":
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be positive")
     
-    if args.init:
+    if args.spotify_budget_status:
+        print(json.dumps(get_metadata_guard().summary(), indent=2))
+    elif args.set_spotify_cooldown is not None:
+        budget = get_metadata_guard()
+        budget.pause(args.set_spotify_cooldown)
+        print(json.dumps(budget.summary(), indent=2))
+    elif args.init:
         init_database()
     elif args.merge:
         merge_csv(args.merge)
@@ -569,6 +600,8 @@ if __name__ == "__main__":
         run_metadata_action(backfill_metadata, args.master, args.checkpoint, dry_run=args.dry_run,
                           fetch_only=args.fetch_only, limit=args.limit,
                           fields=args.fields, extra_metadata=args.extra_metadata)
+    elif args.backfill_local:
+        backfill_local_metadata(args.master, args.local_source_root, args.dry_run)
     elif args.backfill_backlog:
         run_metadata_action(backfill_backlog_metadata, args.backlog, dry_run=args.dry_run, limit=args.limit)
     elif args.apply_backfill:

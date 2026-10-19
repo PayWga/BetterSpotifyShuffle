@@ -15,6 +15,11 @@ from requests.exceptions import RequestException
 from spotipy.exceptions import SpotifyException
 from urllib3.util.retry import Retry
 
+if __package__:
+    from .spotify_budget import SpotifyRequestBudget, SpotifyBudgetBlocked
+else:
+    from spotify_budget import SpotifyRequestBudget, SpotifyBudgetBlocked
+
 
 TRACK_FIELDS = (
     'name', 'track_name', 'artists', 'artist_name', 'artist_ids', 'album',
@@ -23,13 +28,15 @@ TRACK_FIELDS = (
 )
 EXTRA_FIELDS = ('label', 'artist_genres')
 NUMERIC_FIELDS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity'}
-REQUEST_INTERVAL = 2.0
+REQUEST_INTERVAL = 10.0
+REQUEST_REST_EVERY = 50
+REQUEST_REST_SECONDS = 300
 MAX_INLINE_COOLDOWN = 60
 _request_lock = threading.Lock()
 _last_request_started = None
 
 
-class SpotifyCooldown(RuntimeError):
+class SpotifyCooldown(SpotifyBudgetBlocked):
     """Job-wide stop: callers must not treat a 429 as a failed track."""
 
     def __init__(self, retry_after=None):
@@ -48,10 +55,49 @@ class SpotifyCooldown(RuntimeError):
         super().__init__(f'Spotify rate limit: metadata run stopped. {detail}')
 
 
-def metadata_session():
+class BudgetedAdapter(requests.adapters.HTTPAdapter):
+    def __init__(self, budget):
+        super().__init__(max_retries=Retry(total=0, raise_on_status=False))
+        self.budget = budget
+
+    def send(self, request, **kwargs):
+        if self.budget is not None:
+            self.budget.reserve()
+        response = super().send(request, **kwargs)
+        if response.status_code == 429 and self.budget is not None:
+            delay = retry_delay(response.headers)
+            seconds = 86400 if delay is None else delay + 60
+            # The status/headers are enough to enforce a pause. Persist before
+            # reading an optional body, which can itself fail on the network.
+            self.budget.pause(seconds, 'Spotify 429')
+            try:
+                supplied_reason = response.json().get('error', {}).get('reason')
+            except (ValueError, AttributeError, TypeError, RequestException):
+                supplied_reason = None
+            # Only log bounded plain reason codes; never arbitrary response text.
+            if supplied_reason is None:
+                reason = 'unspecified'
+            elif isinstance(supplied_reason, str) and re.fullmatch(r'[A-Za-z0-9_ -]{1,80}', supplied_reason):
+                reason = supplied_reason
+            else:
+                reason = 'unrecognized'
+            # Missing reset information fails conservatively for 24 hours.
+            # A known reset gets a minute of margin, never a shorter wait.
+            response.close()
+            if reason == 'QUOTA_EXCEEDED':
+                self.budget.pause(seconds, 'QUOTA_EXCEEDED')
+            summary = self.budget.summary()
+            print(f"Spotify 429 diagnostics: reason={reason}; "
+                  f"Retry-After={delay}; HTTP attempts in last 30s={summary['attempts_in_last_30s']}, "
+                  f"last 15min={summary['attempts_in_last_15min']}.")
+            self.budget.check_allowed()
+        return response
+
+
+def metadata_session(budget=None):
     """Return 429 responses intact instead of urllib3's headerless RetryError."""
     session = requests.Session()
-    adapter = requests.adapters.HTTPAdapter(max_retries=Retry(total=0, raise_on_status=False))
+    adapter = BudgetedAdapter(budget)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     return session
@@ -158,8 +204,11 @@ def backfill_backlog(backlog_path, client_factory, save, *, sp=None, dry_run=Fal
                         'track_name': metadata.get('track_name'), 'artist_name': metadata.get('artist_name'),
                         'spotify_resolved_id': track['id'], 'spotify_metadata_source': 'spotify_track_api',
                         'spotify_metadata_checked_at': datetime.now(timezone.utc).isoformat()}
+            duration_missing = 'duration_ms' not in df or missing(df.at[index, 'duration_ms'], 'duration_ms')
             for field, value in incoming.items():
                 put(index, field, value)
+            if duration_missing and not missing(incoming['duration_ms'], 'duration_ms'):
+                put(index, 'duration_ms_source', 'spotify_track_api', replace=True)
             if 'spotify_metadata_error' in df and df.at[index, 'spotify_metadata_error']:
                 df.at[index, 'spotify_metadata_error'] = ''
                 dirty = True
@@ -238,8 +287,9 @@ def request(call):
         except SpotifyException as exc:
             if exc.http_status == 429:
                 delay = retry_delay(exc.headers)
-                if delay is None or delay > MAX_INLINE_COOLDOWN or attempt == 3:
-                    raise SpotifyCooldown(delay) from exc
+                # Even a short 429 may represent quota exhaustion. Stop rather
+                # than spending more requests testing the restriction.
+                raise SpotifyCooldown(delay) from exc
             elif attempt == 3 or exc.http_status < 500:
                 raise
             else:
@@ -345,6 +395,48 @@ def apply_checkpoint(master_path, checkpoint, save, dry_run=False):
     return stats
 
 
+def metadata_gap_masks(df, fields):
+    """Find missing cells and unresolved gaps with column operations, not row loops.
+
+    Match local_metadata's name aliases and release-year fallback. Missing optional
+    fields still require a lookup when explicitly requested by the caller.
+    """
+    masks = {}
+
+    def absent(field):
+        if field not in masks:
+            if field not in df:
+                masks[field] = pd.Series(True, index=df.index)
+            else:
+                values = df[field]
+                mask = values.isna() | values.str.strip().eq('')
+                if field in NUMERIC_FIELDS:
+                    mask = mask | values.str.strip().str.casefold().eq('nan')
+                masks[field] = mask
+        return masks[field]
+
+    aliases = {field: group for group in
+               [('name', 'track_name'), ('artists', 'artist_name'), ('album', 'album_name')]
+               for field in group}
+    any_missing = pd.Series(False, index=df.index)
+    needs_api = any_missing.copy()
+    has_release_year = None
+    for field in fields:
+        gap = absent(field)
+        any_missing = any_missing | gap
+        unresolved = gap
+        if field in aliases:
+            for alias in aliases[field]:
+                unresolved = unresolved & absent(alias)
+        elif field in ('year', 'release_year') and 'release_date' in df:
+            if has_release_year is None:
+                has_release_year = df['release_date'].str.strip().str.fullmatch(
+                    r'\d{4}(?:-\d{2})?(?:-\d{2})?', na=False)
+            unresolved = unresolved & ~has_release_year
+        needs_api = needs_api | unresolved
+    return any_missing, needs_api
+
+
 def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=None,
              dry_run=False, fetch_only=False, limit=None, extra_metadata=False):
     master_path, checkpoint = Path(master_path), Path(checkpoint)
@@ -366,11 +458,26 @@ def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=N
         state = {'version': 1, 'master': str(master_path.resolve()), 'fields': fields,
                  'extra_metadata': extra_metadata, 'records': {}, 'unavailable': [], 'retry': []}
     state.setdefault('retry', [])
-    eligible = [tid for tid, row in df.iterrows()
-                if any(missing(row.get(field), field) for field in fields)]
-    stats = {'eligible': len(eligible), 'fetched': 0, 'resumed': 0,
-             'unavailable': 0, 'invalid_ids': 0, 'failed': 0, 'updated_cells': 0}
-    print(f"{len(eligible)} tracks have missing requested metadata.")
+    print('Scanning catalog columns for unresolved metadata gaps...')
+    any_missing, needs_api = metadata_gap_masks(df, fields)
+    valid_ids = df.index.to_series().str.fullmatch(r'[A-Za-z0-9]{22}', na=False)
+    candidates = needs_api & valid_ids if fetch_only else any_missing
+    completed = df.index.isin(set(state['records']) - set(state['retry']))
+    unavailable = df.index.isin(state['unavailable'])
+    queue = candidates & ~completed & ~unavailable
+    eligible = df.index[queue]
+    stats = {'eligible': len(eligible), 'fetched': 0,
+             'resumed': int((candidates & completed & ~unavailable).sum()),
+             'unavailable': int((candidates & unavailable).sum()),
+             'invalid_ids': int((needs_api & ~valid_ids).sum()) if fetch_only else 0,
+             'local_only': int((any_missing & ~needs_api).sum()),
+             'api_needed': int((queue & needs_api & valid_ids).sum()),
+             'failed': 0, 'updated_cells': 0}
+    print(f"{stats['api_needed']} tracks queued for Spotify lookups; "
+          f"{stats['local_only']} tracks have only local fills. "
+          f"Skipped {stats['resumed']} completed and {stats['unavailable']} unavailable lookups.")
+    if fetch_only:
+        print(f"FETCH ONLY: skipping local-only fills and {stats['invalid_ids']} invalid IDs.")
     if dry_run:
         print('DRY RUN: no authentication, requests, or writes.')
         return stats
@@ -379,12 +486,6 @@ def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=N
     dirty = False
     try:
         for tid in eligible:
-            if tid in state['unavailable']:
-                stats['unavailable'] += 1
-                continue
-            if tid in state['records'] and tid not in state['retry']:
-                stats['resumed'] += 1
-                continue
             if limit is not None and processed >= limit:
                 break
             processed += 1

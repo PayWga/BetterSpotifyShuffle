@@ -33,6 +33,9 @@ venv/
 # Folders
 sensitive_info
 
+# Local cross-branch development handoff (also covered by sensitive_info above)
+/sensitive_info/BRANCH_HANDOFF.md
+
 # Reproducible test artifacts and downloaded audio
 .pytest_cache/
 .test-runs/

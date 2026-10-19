@@ -301,32 +301,129 @@ ID. A timestamp/size conflict check aborts rather than overwriting a detected
 external update; concurrent backlog writers remain unsupported. Dry-run reads
 only: no authentication, API requests or writes.
 
-Metadata request attempts start at least two seconds apart (roughly 30 requests
-per minute per process), including failed lookups and every retry. A shared
-monotonic-clock gate covers track, album, and artist requests in master backfill,
-backlog backfill, and sync. Slow responses count toward that interval, so no
-extra delay is added when a request already took two seconds or longer. Separate
-processes and playback polling do not share this limiter; run one metadata job
-at a time. This is a local precaution, not a guarantee against Spotify's
-app-wide limits. Short
-Spotify 429 cooldowns (up to 60 seconds) are respected with bounded retries.
-Longer cooldowns, absent/invalid `Retry-After` values, or exhausted 429 retries
-stop the entire job instead of continuing through tracks. Completed backlog
+Metadata HTTP attempts start at least **10 seconds apart**, with an additional
+**five-minute rest after every 50 attempts**. Failed lookups, retries, and optional
+album/artist requests all count. Slow responses count toward the interval, so
+no extra interval delay is added when a request already took 10 seconds or longer.
+A monotonic gate protects calls within one process; persistent transport pacing
+also coordinates this project's metadata processes and survives restarts. Rest
+waits release the state-file lock and remain interruptible with Ctrl+C.
+
+There is **no default daily request cap**. The previous 200-attempts-per-day cap
+was a local guess, not an established Spotify limit, and is now disabled.
+The retained 24-hour attempt history is for diagnostics, not a quota restriction.
+The interval/rest defaults are conservative settings for sustained metadata
+fetching, not a promise of a safe Spotify threshold. Adjust `REQUEST_INTERVAL`,
+`REQUEST_REST_EVERY`, and `REQUEST_REST_SECONDS` in `scripts/spotify_metadata.py`
+when necessary. Playback polling and apps outside this metadata client are not
+coordinated; run one metadata job at a time and account for other API activity.
+
+Every Spotify 429 now stops immediately, even with a short `Retry-After`; it is
+never automatically retried. The transport recognizes `QUOTA_EXCEEDED` and
+persists the cooldown until `Retry-After` plus a one-minute safety margin.
+Missing or invalid retry times cause a conservative 24-hour pause. Completed backlog
 updates or master metadata checkpoints are saved first; rate limits do not spend
 audio-extraction attempts. The command exits with code 2 and displays the next
 UTC retry time when available. The HTTP session preserves original 429 headers
 so Spotipy cannot discard them in a `Max Retries` exception. This shared handling
 also applies to master metadata backfill. Rerun the same command only after the
-reported cooldown; the command does not schedule a restart or shorten Spotify's
-restriction. If the retry time is unknown, avoid repeated immediate restarts.
+reported cooldown; restarting does not clear recorded cooldowns or batch rests.
+The command does not schedule a restart or shorten Spotify's restriction.
 `--sync` also stops on cooldown and saves successfully fetched records into
 missing master cells before exiting.
+
+Request timestamps, batch-rest state, and Spotify cooldowns live in
+`sensitive_info/spotify_request_budget.json`, protected by a sidecar file lock and
+atomic replacement. It contains no credentials or listening history. Keep the
+file: replacing a checkpoint does not reset it, unreadable budget state blocks
+requests, and manually deleting the file would discard this protection. Calls
+made before this safeguard was installed cannot be counted retroactively.
+Existing running metadata processes must be stopped and restarted to load it.
+
+```powershell
+# Inspect pacing/cooldown status without authenticating or making API requests.
+python scripts/data_merging.py --spotify-budget-status
+
+# Record a cooldown you already received. Seconds are measured from now;
+# this never shortens an existing pause or resets counted attempts.
+python scripts/data_merging.py --set-spotify-cooldown 80000
+```
+
+Dry-run, checkpoint application, and local-only fills consume no HTTP attempts.
+On a future 429, diagnostics include the available error reason and local counts
+for the preceding 30 seconds and 15 minutes. An absent reason is reported as
+unspecified; neither a long cooldown nor successful playback polling proves
+whether a metadata failure was a rate limit or a quota restriction. Spotify
+documents both [rolling-window rate limits](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
+and [separate quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes).
 
 After enrichment, test extraction with your usual cookie option plus
 `--retry-failed --limit 20 --acquisition-workers 1`. Filling metadata does not
 reset the extraction attempt limit. Inspect rejected-candidate examples before
 scaling up; offline regression fixtures do not establish the recovery rate on
 your full catalog.
+
+### Fill the master from all supported local sources
+
+Run this before spending Spotify requests on missing metadata. Stop extraction
+and other master-table writers before applying changes:
+
+```powershell
+# Preview all fills and conflicts; no files change and no Spotify calls occur.
+python scripts/data_merging.py --backfill-local --dry-run
+
+# Apply the same missing-only recovery to the master CSV.
+python scripts/data_merging.py --backfill-local
+```
+
+This single offline command combines:
+
+- Existing master aliases (`name`/`track_name`, `artists`/`artist_name`,
+  `album`/`album_name`), year from a valid stored release date, and that date's
+  represented precision. Derived precision describes the stored date's detail;
+  its provenance does not claim Spotify supplied the precision.
+- History CSV files whose names contain `history` or `listening`, under
+  `sensitive_info/`, including the old `artist` column and history copies.
+- Retained audio history JSON under `sensitive_info/history/`. These exports
+  preserve album names that the normalized CSV dropped. Only explicit Spotify
+  track URIs are matched; playback timestamps never become release years and
+  `ms_played`/`listened_ms` never become recording durations.
+- Saved version-1 `data/*.spotify-metadata.json` results, including the basic
+  metadata checkpoint. Only supported metadata fields listed in the checkpoint
+  are imported; catalog IDs must already exist in the selected master.
+- Successful Spotify metadata saved in `data/dsp_backlog.csv`. Acquisition retry
+  counters, error state, source files, and cached results are left unchanged.
+
+Master aliases take priority, followed by agreement among external sources.
+Conflicting nonempty candidates are skipped and reported per column. Existing
+nonmissing master values, acoustic features/provenance, IDs, and row order are
+preserved. No new tracks are inserted and no generic feature cleanup runs.
+Only newly filled metadata cells receive `<field>_metadata_source` provenance.
+The command uses column operations for master aliases and scans each supported
+source once; it does not checkpoint a million local-only rows.
+
+History `duration_ms` is treated as a confirmed recording duration only when
+the row explicitly identifies polling or a recognized Spotify duration source.
+Other positive history durations may have been estimated by the importer, so
+unambiguous values go into **`history_duration_candidate_ms`**, never silently
+into `duration_ms`. Saved Spotify responses and backlog durations with an explicit
+`duration_ms_source` marker can fill `duration_ms` directly. A row-level Spotify
+source marker is insufficient: API enrichment preserves an older nonmissing
+duration. New backlog API fills now record field-specific duration provenance;
+old unqualified backlog durations remain candidates. A consistent CSV value alone
+does not establish that it was measured by Spotify.
+
+This command works during a Spotify cooldown and never authenticates. It writes
+the master once, atomically, only if cells changed; repeated unchanged runs do not
+rewrite it. A detected concurrent master change aborts the save, but concurrent
+catalog writers remain unsupported. Missing sources are skipped; malformed
+supported source files abort before any master write.
+
+Use `--master path/to/copy.csv` to select another output catalog. Optional
+`--local-source-root path/to/project` selects a root containing `data/` and
+`sensitive_info/` for source discovery; it defaults to this project. This is
+also how offline tests isolate synthetic sources. Arbitrary datasets, audio
+extraction, and network metadata requests are outside this command.
 
 ### Enrich tracks already in the master
 
@@ -350,6 +447,28 @@ python scripts/data_merging.py --backfill --fetch-only
 python scripts/data_merging.py --apply-backfill --dry-run
 python scripts/data_merging.py --apply-backfill
 ```
+
+`--fetch-only` queues only tracks that need Spotify lookups after checking existing
+name aliases and release dates. It scans catalog columns using pandas operations,
+then skips local-only fills, invalid Spotify IDs, completed checkpoint entries,
+and known unavailable tracks before entering the fetch loop. The startup report
+separates remaining API lookups from local-only fills. With `--fetch-only`,
+`--limit` counts queued track lookups (individual retries and optional album/artist
+requests can add HTTP calls). Add `--fetch-only` to a dry-run command to preview
+that same API-only queue. Reading the whole catalog once is still necessary.
+Local-only rows are not added to the fetch-only checkpoint; use normal backfill
+when you also want equivalent metadata copied between existing columns.
+
+To prioritize basic metadata while deferring year, popularity, ISRC, and date
+precision, use:
+
+```powershell
+python scripts/data_merging.py --backfill --fetch-only --fields track_name artist_name album_name duration_ms explicit --checkpoint data/basic.spotify-metadata.json
+```
+
+Existing checkpoints remain compatible. Local-only records already saved by
+older runs are retained; choose a new checkpoint filename if you prefer a fresh,
+smaller checkpoint (prior fetched results will not be reused by the new file).
 
 For later runs, when no other catalog writer is active, `--backfill` without
 `--fetch-only` fetches and then applies in one command. Applying always reloads
@@ -398,7 +517,8 @@ options fail rather than silently reuse another run's results. Checkpoints are
 saved every 50 checked tracks and on orderly exit, including Ctrl+C. Completed
 lookups (including omitted fields), unavailable tracks, and invalid/local IDs are
 skipped on resume. Transient failures are retried on subsequent runs; HTTP 429
-respects `Retry-After`, and transient request errors have bounded retries.
+stops immediately and persists its cooldown, while other transient request
+errors have bounded retries that each consume HTTP budget.
 Authentication/permission failures stop the run with prior progress saved.
 To revisit completed or unavailable lookups, choose a **new checkpoint filename**.
 Custom checkpoint files can contain your track IDs: keep them private; default
