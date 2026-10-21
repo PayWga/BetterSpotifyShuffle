@@ -363,6 +363,50 @@ reset the extraction attempt limit. Inspect rejected-candidate examples before
 scaling up; offline regression fixtures do not establish the recovery rate on
 your full catalog.
 
+### Fill audio-search metadata directly in the backlog
+
+Tracks absent from master also need metadata to acquire the right audio. This
+offline command fills missing cells in `data/dsp_backlog.csv` directly:
+
+```powershell
+python scripts/data_merging.py --backfill-backlog-local --dry-run
+python scripts/data_merging.py --backfill-backlog-local
+```
+
+It matches exact Spotify track IDs against the supported history CSV/JSON
+exports and master catalog, preserving backlog row order, existing values,
+attempt counts and error state. It supplies missing names/artists/albums,
+confirmed recording durations and available metadata. Existing structured
+`spotify_artist_names` lists from master are copied as lists, without guessing
+artist boundaries from a comma-separated credit. Conflicting local candidates
+are skipped and newly filled cells receive per-field source provenance.
+
+Confirmed durations include history rows labeled `polling` or `live_polling`,
+and explicit supported duration provenance. Unqualified durations are retained
+only as `history_duration_candidate_ms`; playback time never becomes recording
+duration. Original track/version labels are preserved. Audio extraction uses
+the recovered `duration_ms`, `track_name`, `artist_name` and available Spotify
+artist lists on its next run. No acoustic features are inferred from history.
+
+By default this action never opens Spotify checkpoint files and never makes
+API calls. It writes only the backlog, so it can run alongside the existing
+`--backfill --fetch-only` job, which writes a separate checkpoint. Do not run it
+alongside extraction or backlog API enrichment, because those also write the
+backlog. Changing metadata does not alter an already-running job's in-memory
+catalog. The master and all history/source files remain unchanged.
+
+After fetch jobs finish, saved checkpoints can optionally contribute too:
+
+```powershell
+python scripts/data_merging.py --backfill-backlog-local --include-local-checkpoints --dry-run
+python scripts/data_merging.py --backfill-backlog-local --include-local-checkpoints
+```
+
+Use `--backlog PATH` to select a different target, and `--local-source-root PATH`
+for a source project root containing `data/` and `sensitive_info/`. A detected
+change to the target during processing aborts the write. The action neither
+inserts new backlog tracks nor resets extraction retries.
+
 ### Fill the master from all supported local sources
 
 Run this before spending Spotify requests on missing metadata. Stop extraction

@@ -18,6 +18,7 @@ ALIASES = {field: group for group in GROUPS for field in group}
 FIELDS = set(sm.TRACK_FIELDS + sm.EXTRA_FIELDS + ('release_year',))
 INTEGERS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity',
             'history_duration_candidate_ms'}
+MATCHING_FIELDS = {'spotify_track_name', 'spotify_artist_names'}
 
 
 def missing_mask(df, field):
@@ -50,12 +51,12 @@ def put(df, field, values, source, counts):
     counts[field] = counts.get(field, 0) + n
 
 
-def fill_aliases(df, counts):
+def fill_aliases(df, counts, origin='master'):
     for group in GROUPS:
         for target in group:
             for source in group:
                 if source != target and source in df:
-                    put(df, target, df[source], f'master:{source}', counts)
+                    put(df, target, df[source], f'{origin}:{source}', counts)
     if 'release_date' not in df:
         return
     dates = df['release_date'].str.strip()
@@ -77,14 +78,22 @@ def fill_aliases(df, counts):
         except ValueError:
             continue
     years = dates.map({text: value[0] for text, value in unique.items()})
-    put(df, 'year', years, 'master:release_date', counts)
+    put(df, 'year', years, f'{origin}:release_date', counts)
     if 'release_year' in df:
-        put(df, 'release_year', years, 'master:release_date', counts)
+        put(df, 'release_year', years, f'{origin}:release_date', counts)
     precision = dates.map({text: value[1] for text, value in unique.items()})
-    put(df, 'release_date_precision', precision, 'master:release_date', counts)
+    put(df, 'release_date_precision', precision, f'{origin}:release_date', counts)
 
 
 def normalize(field, value):
+    if field == 'spotify_artist_names':
+        try:
+            names = json.loads(value) if isinstance(value, str) else value
+        except ValueError:
+            return None
+        if not isinstance(names, list) or not names or not all(isinstance(n, str) and n.strip() for n in names):
+            return None
+        return json.dumps([n.strip() for n in names], ensure_ascii=False)
     if value is None or (not isinstance(value, (list, dict)) and pd.isna(value)):
         return None
     if field in INTEGERS:
@@ -110,14 +119,15 @@ def normalize(field, value):
 
 
 class Candidates:
-    def __init__(self, df):
+    def __init__(self, df, allow_matching=False):
         self.df = df
         self.gaps = {}
         self.values = {}
         self.conflicts = {}
+        self.fields = FIELDS | (MATCHING_FIELDS if allow_matching else set())
 
     def add(self, tid, field, value, source):
-        if field not in FIELDS and field != 'history_duration_candidate_ms':
+        if field not in self.fields and field != 'history_duration_candidate_ms':
             return
         if tid not in self.df.index:
             return
@@ -144,9 +154,17 @@ class Candidates:
                     pd.Series({tid: record[1] for tid, record in valid.items()}), counts)
 
 
+def confirmed_duration(row):
+    return (row.get('event_source') in ('polling', 'live_polling')
+            or row.get('duration_ms_source') in ('spotify', 'spotify_track_api', 'spotify_polling')
+            or str(row.get('duration_ms_metadata_source', '')).startswith(
+                ('spotify_cache:', 'history_csv:', 'master_csv:')))
+
+
 def history_csv(path, candidates):
     columns = {'track_id', 'id', 'track_name', 'name', 'artist_name', 'artists', 'artist',
-               'album', 'album_name', 'duration_ms', 'event_source', 'duration_ms_source'}
+               'album', 'album_name', 'duration_ms', 'event_source', 'duration_ms_source',
+               'duration_ms_metadata_source'} | MATCHING_FIELDS
     for chunk in pd.read_csv(path, dtype='string', keep_default_na=False, chunksize=100000,
                              usecols=lambda col: col in columns):
         if 'track_id' not in chunk and 'id' not in chunk:
@@ -157,8 +175,9 @@ def history_csv(path, candidates):
             for field in ('name', 'track_name', 'artists', 'artist_name', 'album', 'album_name'):
                 candidates.add(tid, field, row.get(field), source)
             candidates.add(tid, 'artist_name', row.get('artist'), source)
-            verified = (row.get('event_source') == 'polling' or
-                        row.get('duration_ms_source') in ('spotify', 'spotify_track_api', 'spotify_polling'))
+            for field in MATCHING_FIELDS:
+                candidates.add(tid, field, row.get(field), source)
+            verified = confirmed_duration(row)
             duration_field = 'duration_ms' if verified else 'history_duration_candidate_ms'
             # ms_played/listened_ms never enter the recording duration column.
             candidates.add(tid, duration_field, row.get('duration_ms'), source)
@@ -185,7 +204,7 @@ def spotify_cache(path, candidates):
         state = json.load(source)
     if state.get('version') != 1 or not isinstance(state.get('records'), dict):
         raise ValueError(f'Unsupported Spotify checkpoint: {path.name}')
-    fields = set(state.get('fields', [])) & FIELDS
+    fields = set(state.get('fields', [])) & candidates.fields
     for tid, row in state['records'].items():
         if not isinstance(row, dict):
             raise ValueError(f'Invalid Spotify checkpoint record: {path.name}')
@@ -214,16 +233,45 @@ def spotify_backlog(path, candidates):
             candidates.add(tid, 'artist_name', ', '.join(artists), 'spotify_backlog')
 
 
-def run(master_path, source_root, save, dry_run=False):
+def master_csv(path, candidates):
+    columns = candidates.fields | {'id', 'duration_ms_source', 'duration_ms_metadata_source'}
+    for chunk in pd.read_csv(path, dtype='string', keep_default_na=False, chunksize=100000,
+                             usecols=lambda col: col in columns):
+        if 'id' not in chunk:
+            raise ValueError('Master source needs id')
+        # The master can dwarf the backlog; inspect only IDs relevant to this job.
+        chunk = chunk[chunk['id'].str.strip().isin(candidates.df.index)]
+        for row in chunk.to_dict('records'):
+            tid = str(row['id']).strip()
+            source = f'master_csv:{path.name}'
+            for field in candidates.fields - {'duration_ms'}:
+                candidates.add(tid, field, row.get(field), source)
+            duration = 'duration_ms' if confirmed_duration(row) else 'history_duration_candidate_ms'
+            candidates.add(tid, duration, row.get('duration_ms'), source)
+
+
+def run(master_path, source_root, save, dry_run=False, *, target='master', include_checkpoints=True):
     path, root = Path(master_path), Path(source_root)
+    if target not in ('master', 'backlog'):
+        raise ValueError('Unknown local backfill target')
     signature = lambda: (path.stat().st_mtime_ns, path.stat().st_size)
     original = signature()
-    print('Reading master catalog for offline backfill...', flush=True)
-    df = sm.read_catalog(path)
+    print(f'Reading {target} catalog for offline backfill...', flush=True)
+    if target == 'master':
+        df = sm.read_catalog(path)
+    else:
+        df = pd.read_csv(path, dtype='string', keep_default_na=False)
+        if ('track_id' not in df or df['track_id'].str.strip().eq('').any()
+                or df['track_id'].duplicated().any()):
+            raise ValueError('Backlog needs unique nonempty track_id values')
+        df = df.set_index('track_id')
     counts = {}
-    print('Filling master aliases and deriving date metadata...', flush=True)
-    fill_aliases(df, counts)
-    candidates = Candidates(df)
+    print(f'Filling {target} aliases and deriving date metadata...', flush=True)
+    if target == 'master':
+        fill_aliases(df, counts)
+    else:
+        fill_aliases(df, counts, origin=target)
+    candidates = Candidates(df, allow_matching=target == 'backlog')
     private, data = root / 'sensitive_info', root / 'data'
     sources = []
     sources += [(p, history_csv) for p in sorted(private.rglob('*.csv'))
@@ -231,19 +279,27 @@ def run(master_path, source_root, save, dry_run=False):
     history_dir = private / 'history'
     sources += [(p, history_json) for p in sorted(history_dir.rglob('*.json'))
                 if 'audio' in p.name.casefold() or 'streaminghistory' in p.name.casefold()]
-    sources += [(p, spotify_cache) for p in sorted(data.glob('*.spotify-metadata.json'))]
-    if (data / 'dsp_backlog.csv').exists():
+    if include_checkpoints:
+        sources += [(p, spotify_cache) for p in sorted(data.glob('*.spotify-metadata.json'))]
+    if target == 'backlog' and (data / 'master_track_table.csv').exists():
+        if path.resolve() == (data / 'master_track_table.csv').resolve():
+            raise ValueError('Backlog target must be separate from the master source')
+        sources.append((data / 'master_track_table.csv', master_csv))
+    if target == 'master' and (data / 'dsp_backlog.csv').exists():
         sources.append((data / 'dsp_backlog.csv', spotify_backlog))
     for number, (source_path, reader) in enumerate(sources, 1):
         print(f'Reading local metadata source {number}/{len(sources)} ({reader.__name__})...', flush=True)
         reader(source_path, candidates)
     candidates.apply(counts)
     # External metadata can complete aliases or supply a release_date.
-    fill_aliases(df, counts)
+    if target == 'master':
+        fill_aliases(df, counts)
+    else:
+        fill_aliases(df, counts, origin=target)
     total = sum(counts.values())
     if not dry_run and total:
         if signature() != original:
-            raise RuntimeError('Master CSV changed during local backfill; stop other catalog writers')
+            raise RuntimeError(f'{target.title()} CSV changed during local backfill; stop other catalog writers')
         save(df.reset_index(), path)
     result = {'updated_cells': total, 'columns': counts, 'conflicts': candidates.conflicts,
               'sources_read': len(sources)}

@@ -374,6 +374,15 @@ def backfill_local_metadata(master_path=None, source_root=None, dry_run=False):
                               save_database, dry_run)
 
 
+def backfill_local_backlog_metadata(backlog_path=None, source_root=None, dry_run=False,
+                                   include_checkpoints=False):
+    """Fill backlog search metadata offline; do not open active API checkpoints."""
+    return local_backfill.run(DATA_DIR / 'dsp_backlog.csv' if backlog_path is None else backlog_path,
+                              PROJECT_ROOT if source_root is None else source_root,
+                              save_database, dry_run, target='backlog',
+                              include_checkpoints=include_checkpoints)
+
+
 def backfill_metadata(master_path=None, checkpoint=None, **options):
     """Fill existing catalog gaps, or stage metadata while extraction runs."""
     master_path = Path(MASTER_DB if master_path is None else master_path)
@@ -549,6 +558,7 @@ if __name__ == "__main__":
     actions.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
     actions.add_argument("--backfill", action="store_true", help="Fill missing Spotify metadata for existing master tracks")
     actions.add_argument("--backfill-local", action="store_true", help="Fill missing master metadata from local aliases, history, and saved Spotify data; no API calls")
+    actions.add_argument('--backfill-backlog-local', action='store_true', help='Fill missing backlog metadata from local history/master; no API calls or checkpoint reads by default')
     actions.add_argument("--backfill-backlog", action="store_true", help="Fill missing duration/recording metadata directly in the audio backlog")
     actions.add_argument("--apply-backfill", action="store_true", help="Apply a metadata checkpoint after other catalog writers stop")
     actions.add_argument("--repair", action="store_true", help="Clean identifiers, duplicates, and invalid feature values")
@@ -557,6 +567,7 @@ if __name__ == "__main__":
     actions.add_argument("--set-spotify-cooldown", type=float, metavar="SECONDS", help="Persist a known cooldown without making API calls; never shortens an existing pause")
     parser.add_argument("--master", type=Path, help="Master CSV for placeholder cleanup or metadata backfill")
     parser.add_argument("--local-source-root", type=Path, help="Project root containing data/ and sensitive_info/ for --backfill-local")
+    parser.add_argument('--include-local-checkpoints', action='store_true', help='Also read saved Spotify checkpoints during --backfill-backlog-local; use only after fetch jobs finish')
     parser.add_argument("--backlog", type=Path, help="Backlog CSV for --backfill-backlog")
     parser.add_argument("--dry-run", action="store_true", help="Preview cleanup/backfill/apply without writing or API requests")
     parser.add_argument("--checkpoint", type=Path, help="Resumable metadata JSON (default: beside the selected master)")
@@ -567,14 +578,16 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     enrichment = args.backfill or args.apply_backfill
-    if args.local_source_root is not None and not args.backfill_local:
-        parser.error('--local-source-root requires --backfill-local')
+    if args.local_source_root is not None and not (args.backfill_local or args.backfill_backlog_local):
+        parser.error('--local-source-root requires --backfill-local or --backfill-backlog-local')
+    if args.include_local_checkpoints and not args.backfill_backlog_local:
+        parser.error('--include-local-checkpoints requires --backfill-backlog-local')
     if args.master is not None and not (args.clear_placeholders or enrichment or args.backfill_local):
         parser.error("--master and --dry-run require --clear-placeholders, --backfill, or --apply-backfill")
-    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog or args.backfill_local):
+    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog or args.backfill_local or args.backfill_backlog_local):
         parser.error("--dry-run requires a cleanup or metadata action")
-    if args.backlog is not None and not args.backfill_backlog:
-        parser.error("--backlog requires --backfill-backlog")
+    if args.backlog is not None and not (args.backfill_backlog or args.backfill_backlog_local):
+        parser.error('--backlog requires --backfill-backlog or --backfill-backlog-local')
     if args.checkpoint is not None and not enrichment:
         parser.error("--checkpoint requires --backfill or --apply-backfill")
     if (args.fetch_only or args.fields or args.extra_metadata) and not args.backfill:
@@ -602,6 +615,9 @@ if __name__ == "__main__":
                           fields=args.fields, extra_metadata=args.extra_metadata)
     elif args.backfill_local:
         backfill_local_metadata(args.master, args.local_source_root, args.dry_run)
+    elif args.backfill_backlog_local:
+        backfill_local_backlog_metadata(args.backlog, args.local_source_root, args.dry_run,
+                                       args.include_local_checkpoints)
     elif args.backfill_backlog:
         run_metadata_action(backfill_backlog_metadata, args.backlog, dry_run=args.dry_run, limit=args.limit)
     elif args.apply_backfill:
