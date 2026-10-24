@@ -1,9 +1,10 @@
 """Offline, missing-only metadata recovery from explicitly supported local files."""
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal, InvalidOperation
 import json
 import re
 from pathlib import Path
+from statistics import median
 
 import pandas as pd
 
@@ -19,6 +20,8 @@ FIELDS = set(sm.TRACK_FIELDS + sm.EXTRA_FIELDS + ('release_year',))
 INTEGERS = {'year', 'release_year', 'duration_ms', 'track_number', 'disc_number', 'popularity',
             'history_duration_candidate_ms'}
 MATCHING_FIELDS = {'spotify_track_name', 'spotify_artist_names'}
+ESTIMATE_SOURCE = 'history_completed_play_median'
+MIN_COMPLETED_PLAYS = 2
 
 
 def missing_mask(df, field):
@@ -31,10 +34,12 @@ def missing_mask(df, field):
     return result
 
 
-def put(df, field, values, source, counts):
-    """Vectorized assignment; provenance changes only for newly filled cells."""
+def put(df, field, values, source, counts, *, refresh_evidence=False):
+    """Fill gaps; refresh_evidence is only for evidence of a newly filled estimate."""
     values = values.reindex(df.index).astype('string')
-    fill = missing_mask(df, field) & values.notna() & values.str.strip().ne('')
+    fill = values.notna() & values.str.strip().ne('')
+    if not refresh_evidence:
+        fill &= missing_mask(df, field)
     n = int(fill.sum())
     if not n:
         return
@@ -125,6 +130,65 @@ class Candidates:
         self.values = {}
         self.conflicts = {}
         self.fields = FIELDS | (MATCHING_FIELDS if allow_matching else set())
+        # Only retain events for duration gaps, not the million-track catalog.
+        self.duration_gaps = set(df.index[missing_mask(df, 'duration_ms')])
+        self.completed_plays = {}
+
+    def add_completed_play(self, tid, row):
+        """Deduplicate raw completed events across exports by UTC timestamp."""
+        if tid not in self.duration_gaps or row.get('reason_end') != 'trackdone':
+            return
+        duration = normalize('duration_ms', row.get('ms_played'))
+        timestamp = row.get('ts')
+        if duration is None or not isinstance(timestamp, str):
+            return
+        try:
+            event = datetime.fromisoformat(timestamp.replace('Z', '+00:00'))
+            if event.tzinfo is None:
+                return
+            event = event.astimezone(timezone.utc)
+        except (ValueError, OverflowError):
+            return
+        events = self.completed_plays.setdefault(tid, {})
+        duration = int(duration)
+        if event not in events:
+            events[event] = duration
+        elif events[event] != duration:
+            # Conflicting copies remain excluded even if later copies agree.
+            events[event] = None
+
+    def apply_duration_estimates(self, counts):
+        """Use repeatable full-play medians only after confirmed local fills."""
+        remaining = set(self.df.index[missing_mask(self.df, 'duration_ms')])
+        estimates, observations, supports = {}, {}, {}
+        for tid, events in self.completed_plays.items():
+            if tid not in remaining:
+                continue
+            # Do not sidestep disagreement between confirmed local sources.
+            if tid in self.values.get('duration_ms', {}) and self.values['duration_ms'][tid] is None:
+                continue
+            values = [value for value in events.values() if value is not None]
+            if len(values) < MIN_COMPLETED_PLAYS:
+                continue
+            estimate = int(round(median(values)))
+            support = sum(abs(value - estimate) * 1000 <= estimate for value in values)
+            if support < MIN_COMPLETED_PLAYS or support * 5 < len(values) * 4:
+                continue
+            estimates[tid] = str(estimate)
+            observations[tid] = str(len(values))
+            supports[tid] = str(support)
+        if estimates:
+            put(self.df, 'duration_ms', pd.Series(estimates), ESTIMATE_SOURCE, counts)
+            # Evidence belongs to this newly filled duration. Orphaned flags or
+            # counts from a previous, now-missing duration must not describe it.
+            put(self.df, 'duration_ms_is_estimated',
+                pd.Series('True', index=list(estimates)), ESTIMATE_SOURCE, counts,
+                refresh_evidence=True)
+            put(self.df, 'duration_ms_estimate_observations',
+                pd.Series(observations), ESTIMATE_SOURCE, counts, refresh_evidence=True)
+            put(self.df, 'duration_ms_estimate_support',
+                pd.Series(supports), ESTIMATE_SOURCE, counts, refresh_evidence=True)
+        return len(estimates)
 
     def add(self, tid, field, value, source):
         if field not in self.fields and field != 'history_duration_candidate_ms':
@@ -179,7 +243,7 @@ def history_csv(path, candidates):
                 candidates.add(tid, field, row.get(field), source)
             verified = confirmed_duration(row)
             duration_field = 'duration_ms' if verified else 'history_duration_candidate_ms'
-            # ms_played/listened_ms never enter the recording duration column.
+            # Imported fractions/durations are not independent full-play evidence.
             candidates.add(tid, duration_field, row.get('duration_ms'), source)
 
 
@@ -193,6 +257,7 @@ def history_json(path, candidates):
         if not isinstance(uri, str) or not uri.startswith('spotify:track:'):
             continue
         tid = uri.removeprefix('spotify:track:')
+        candidates.add_completed_play(tid, row)
         for field, key in [('track_name', 'master_metadata_track_name'),
                            ('artist_name', 'master_metadata_album_artist_name'),
                            ('album_name', 'master_metadata_album_album_name')]:
@@ -291,6 +356,10 @@ def run(master_path, source_root, save, dry_run=False, *, target='master', inclu
         print(f'Reading local metadata source {number}/{len(sources)} ({reader.__name__})...', flush=True)
         reader(source_path, candidates)
     candidates.apply(counts)
+    estimated = candidates.apply_duration_estimates(counts)
+    print(f"{'DRY RUN: would estimate' if dry_run else 'Estimated'} {estimated} missing durations "
+          f'from repeated completed plays (at least {MIN_COMPLETED_PLAYS} supporting events; '
+          '80% within 0.1% of median).', flush=True)
     # External metadata can complete aliases or supply a release_date.
     if target == 'master':
         fill_aliases(df, counts)
@@ -302,7 +371,7 @@ def run(master_path, source_root, save, dry_run=False, *, target='master', inclu
             raise RuntimeError(f'{target.title()} CSV changed during local backfill; stop other catalog writers')
         save(df.reset_index(), path)
     result = {'updated_cells': total, 'columns': counts, 'conflicts': candidates.conflicts,
-              'sources_read': len(sources)}
+              'sources_read': len(sources), 'estimated_durations': estimated}
     print(f"{'DRY RUN: would fill' if dry_run else 'Filled'} {total} local metadata cells: {counts}")
     print(f'Skipped conflicting candidates by column: {candidates.conflicts}')
     print('Offline only: no Spotify authentication or requests.')

@@ -73,6 +73,83 @@ def test_fetch_only_resumes_and_apply_reads_latest_catalog(catalog, tmp_path):
     assert catalog.read_bytes() == before
 
 
+def test_recent_listening_priority_uses_latest_utc_event_and_resumes(tmp_path):
+    path = tmp_path / 'master.csv'
+    c, d, e = 'C' * 22, 'D' * 22, 'E' * 22
+    path.write_text('id,duration_ms\n' + ''.join(f'{tid},\n' for tid in [A, B, c, d, e]))
+    history = tmp_path / 'history.csv'
+    history.write_text('track_id,timestamp\n'
+                       f'{A},2020-01-01T00:00:00Z\n'
+                       f'{B},2026-01-02T00:30:00+03:00\n'
+                       f'{A},2026-01-01T23:00:00Z\n'
+                       f'{c},2026-01-01 21:30:00\n'
+                       f'{d},invalid\nunknown,2030-01-01T00:00:00Z\n')
+    original = path.read_bytes(), history.read_bytes()
+    checkpoint = tmp_path / 'state.json'
+    sp = Spotify()
+    # Catalog order is unchanged without the flag.
+    dm.backfill_metadata(path, checkpoint, fields=['duration_ms'], sp=sp,
+                         fetch_only=True, limit=1)
+    assert sp.calls == [A]
+    dm.backfill_metadata(path, checkpoint, fields=['duration_ms'], sp=sp,
+                         fetch_only=True, recent_first=True, history_path=history, limit=1)
+    assert sp.calls == [A, B]
+    dm.backfill_metadata(path, checkpoint, fields=['duration_ms'], sp=sp,
+                         fetch_only=True, recent_first=True, history_path=history)
+    # B and C have equal UTC times. D and E have no usable history.
+    assert sp.calls == [A, B, c, d, e]
+    assert original == (path.read_bytes(), history.read_bytes())
+
+
+def test_recent_priority_puts_newest_ahead_of_catalog_order(tmp_path):
+    path = tmp_path / 'master.csv'
+    path.write_text(f'id,duration_ms\n{A},\n{B},\n')
+    history = tmp_path / 'history.csv'
+    history.write_text(f'track_id,timestamp\n{A},2024-01-01\n{B},2020-01-01\n'
+                       f'{B},2026-01-01T00:00:00Z\n')
+    sp = Spotify()
+    dm.backfill_metadata(path, tmp_path / 'state.json', fields=['duration_ms'], sp=sp,
+                         fetch_only=True, recent_first=True, history_path=history, limit=1)
+    assert sp.calls == [B]
+
+
+@pytest.mark.parametrize('contents', [None, 'track_id\n' + A + '\n', 'timestamp\n2026-01-01\n'])
+def test_recent_priority_rejects_missing_or_malformed_history_before_requests(tmp_path, contents, monkeypatch):
+    path = tmp_path / 'master.csv'
+    path.write_text(f'id,duration_ms\n{A},\n')
+    history = tmp_path / 'history.csv'
+    if contents is not None:
+        history.write_text(contents)
+    checkpoint = tmp_path / 'state.json'
+    def forbidden():
+        pytest.fail('Invalid history must fail before authentication')
+    monkeypatch.setattr(dm, 'get_spotify_client', forbidden)
+    with pytest.raises((ValueError, FileNotFoundError)):
+        dm.backfill_metadata(path, checkpoint, fields=['duration_ms'], recent_first=True,
+                             history_path=history, sp=None)
+    assert not checkpoint.exists()
+
+
+def test_cli_recent_priority_dry_run_uses_selected_history_without_writes(tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    path = tmp_path / 'master.csv'
+    path.write_text(f'id,duration_ms\n{A},\n')
+    history = tmp_path / 'history.csv'
+    history.write_text(f'track_id,timestamp\n{A},2026-01-01\n')
+    checkpoint = tmp_path / 'state.json'
+    before = path.read_bytes(), history.read_bytes()
+    result = subprocess.run([sys.executable, str(Path(dm.__file__).resolve()), '--backfill',
+                             '--master', str(path), '--checkpoint', str(checkpoint),
+                             '--fields', 'duration_ms', '--fetch-only', '--recent-first',
+                             '--history', str(history), '--dry-run'], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert 'most recently listened' in result.stdout.lower()
+    assert before == (path.read_bytes(), history.read_bytes())
+    assert not checkpoint.exists()
+
+
 def test_dry_run_has_no_auth_network_or_writes(catalog, tmp_path, monkeypatch):
     def forbidden():
         pytest.fail('dry run authenticated')

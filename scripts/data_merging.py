@@ -387,6 +387,8 @@ def backfill_metadata(master_path=None, checkpoint=None, **options):
     """Fill existing catalog gaps, or stage metadata while extraction runs."""
     master_path = Path(MASTER_DB if master_path is None else master_path)
     checkpoint = Path(checkpoint) if checkpoint is not None else master_path.with_suffix('.spotify-metadata.json')
+    if options.get('recent_first') and options.get('history_path') is None:
+        options['history_path'] = HISTORY_DB
     return spotify_metadata.backfill(master_path, checkpoint, get_spotify_client,
                                      save_database, **options)
 
@@ -572,11 +574,17 @@ if __name__ == "__main__":
     parser.add_argument("--dry-run", action="store_true", help="Preview cleanup/backfill/apply without writing or API requests")
     parser.add_argument("--checkpoint", type=Path, help="Resumable metadata JSON (default: beside the selected master)")
     parser.add_argument("--fetch-only", action="store_true", help="Fetch to checkpoint only; safe while extraction runs")
+    parser.add_argument('--recent-first', action='store_true', help='Prioritize tracks listened to most recently in the remaining backfill queue')
+    parser.add_argument('--history', type=Path, help='Listening CSV with track_id and timestamp for --recent-first (default: sensitive_info/spotify_listening_history.csv)')
     parser.add_argument("--limit", type=int, help="Maximum new tracks to check in this backfill run")
     parser.add_argument("--fields", nargs='+', help="Only backfill these supported metadata columns")
     parser.add_argument("--extra-metadata", action="store_true", help="Also fetch album label and artist_genres, with cached album/artist requests")
     
     args = parser.parse_args()
+    if args.recent_first and not args.backfill:
+        parser.error('--recent-first requires --backfill')
+    if args.history is not None and not args.recent_first:
+        parser.error('--history requires --recent-first')
     enrichment = args.backfill or args.apply_backfill
     if args.local_source_root is not None and not (args.backfill_local or args.backfill_backlog_local):
         parser.error('--local-source-root requires --backfill-local or --backfill-backlog-local')
@@ -612,7 +620,8 @@ if __name__ == "__main__":
     elif args.backfill:
         run_metadata_action(backfill_metadata, args.master, args.checkpoint, dry_run=args.dry_run,
                           fetch_only=args.fetch_only, limit=args.limit,
-                          fields=args.fields, extra_metadata=args.extra_metadata)
+                          fields=args.fields, extra_metadata=args.extra_metadata,
+                          recent_first=args.recent_first, history_path=args.history)
     elif args.backfill_local:
         backfill_local_metadata(args.master, args.local_source_root, args.dry_run)
     elif args.backfill_backlog_local:

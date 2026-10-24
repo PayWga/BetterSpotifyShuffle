@@ -437,8 +437,34 @@ def metadata_gap_masks(df, fields):
     return any_missing, needs_api
 
 
+def recent_listening_order(eligible, history_path):
+    """Rank only remaining candidates; preserve catalog order for ties/unknowns."""
+    if not len(eligible):
+        return eligible
+    if history_path is None:
+        raise ValueError('Recent-first ordering needs a listening history CSV')
+    latest = {}
+    for chunk in pd.read_csv(history_path, usecols=['track_id', 'timestamp'],
+                             dtype='string', keep_default_na=False, chunksize=100000):
+        chunk['track_id'] = chunk['track_id'].str.strip()
+        chunk = chunk[chunk['track_id'].isin(eligible)].copy()
+        if chunk.empty:
+            continue
+        chunk['timestamp'] = pd.to_datetime(chunk['timestamp'], format='mixed',
+                                            utc=True, errors='coerce')
+        for tid, timestamp in chunk.groupby('track_id')['timestamp'].max().items():
+            if pd.notna(timestamp) and (tid not in latest or timestamp > latest[tid]):
+                latest[tid] = timestamp
+    priority = pd.Series([latest.get(tid, pd.NaT) for tid in eligible], index=eligible,
+                         dtype='datetime64[ns, UTC]')
+    print(f'Ordering most recently listened tracks first: {len(latest)} dated; '
+          f'{len(eligible) - len(latest)} without usable history follow in catalog order.')
+    return priority.sort_values(ascending=False, kind='stable', na_position='last').index
+
+
 def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=None,
-             dry_run=False, fetch_only=False, limit=None, extra_metadata=False):
+             dry_run=False, fetch_only=False, limit=None, extra_metadata=False,
+             recent_first=False, history_path=None):
     master_path, checkpoint = Path(master_path), Path(checkpoint)
     if master_path.resolve() == checkpoint.resolve():
         raise ValueError('Checkpoint must be separate from the master CSV')
@@ -478,6 +504,8 @@ def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=N
           f"Skipped {stats['resumed']} completed and {stats['unavailable']} unavailable lookups.")
     if fetch_only:
         print(f"FETCH ONLY: skipping local-only fills and {stats['invalid_ids']} invalid IDs.")
+    if recent_first:
+        eligible = recent_listening_order(eligible, history_path)
     if dry_run:
         print('DRY RUN: no authentication, requests, or writes.')
         return stats

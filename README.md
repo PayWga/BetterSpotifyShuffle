@@ -383,8 +383,9 @@ are skipped and newly filled cells receive per-field source provenance.
 
 Confirmed durations include history rows labeled `polling` or `live_polling`,
 and explicit supported duration provenance. Unqualified durations are retained
-only as `history_duration_candidate_ms`; playback time never becomes recording
-duration. Original track/version labels are preserved. Audio extraction uses
+only as `history_duration_candidate_ms`. Repeated completed plays can also fill
+missing durations as explicitly labelled estimates, using the evidence rules
+below. Original track/version labels are preserved. Audio extraction uses
 the recovered `duration_ms`, `track_name`, `artist_name` and available Spotify
 artist lists on its next run. No acoustic features are inferred from history.
 
@@ -430,8 +431,9 @@ This single offline command combines:
   `sensitive_info/`, including the old `artist` column and history copies.
 - Retained audio history JSON under `sensitive_info/history/`. These exports
   preserve album names that the normalized CSV dropped. Only explicit Spotify
-  track URIs are matched; playback timestamps never become release years and
-  `ms_played`/`listened_ms` never become recording durations.
+  track URIs are matched; playback timestamps never become release years.
+  Repeated `trackdone` events can supply labelled duration estimates as described
+  below; skipped/partial playback time is never used as recording duration.
 - Saved version-1 `data/*.spotify-metadata.json` results, including the basic
   metadata checkpoint. Only supported metadata fields listed in the checkpoint
   are imported; catalog IDs must already exist in the selected master.
@@ -456,6 +458,42 @@ source marker is insufficient: API enrichment preserves an older nonmissing
 duration. New backlog API fills now record field-specific duration provenance;
 old unqualified backlog durations remain candidates. A consistent CSV value alone
 does not establish that it was measured by Spotify.
+
+After confirmed local fills, remaining missing durations can be estimated from
+raw audio JSON records marked `reason_end=trackdone`. The method takes the median
+positive integral `ms_played`, requiring at least **two supporting completed
+plays** and **80% of distinct events within 0.1% of the median**. Events must have
+valid timezone-aware timestamps; track ID plus UTC timestamp deduplicates copies
+across exports. Conflicting copies of the same event are excluded. Partial plays,
+CSV completion percentages, and importer fallback durations do not qualify.
+The thresholds test consistency, not guaranteed accuracy against Spotify.
+
+Accepted estimates fill `duration_ms` only when still missing and record:
+
+- `duration_ms_metadata_source=history_completed_play_median`
+- `duration_ms_is_estimated=True`
+- `duration_ms_estimate_observations`: distinct valid completed-play events
+- `duration_ms_estimate_support`: events within 0.1% of the median
+
+Both `--backfill-local` and `--backfill-backlog-local` use these rules. The summary
+reports how many durations were estimated, including in `--dry-run`. Existing
+durations are never replaced, and estimates remain distinguishable from confirmed
+Spotify values. When filling a missing duration, its estimate flag and evidence
+counts are refreshed together, replacing any orphaned evidence from an older
+value. Once local fills are applied, subsequent API runs skip tracks
+whose requested fields are complete. A job already running keeps its in-memory
+queue until restarted.
+
+To fetch only remaining duration gaps after local backfill:
+
+```powershell
+python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json --dry-run
+python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json
+```
+
+This uses a separate checkpoint because the existing basic checkpoint has a
+different field selection. Requesting `explicit` or other missing fields still
+requires a lookup even when duration has been recovered locally.
 
 This command works during a Spotify cooldown and never authenticates. It writes
 the master once, atomically, only if cells changed; repeated unchanged runs do not
@@ -502,6 +540,28 @@ requests can add HTTP calls). Add `--fetch-only` to a dry-run command to preview
 that same API-only queue. Reading the whole catalog once is still necessary.
 Local-only rows are not added to the fetch-only checkpoint; use normal backfill
 when you also want equivalent metadata copied between existing columns.
+
+Add `--recent-first` to prioritize **most recently listened-to tracks**, using
+each queued track's latest `timestamp` in
+`sensitive_info/spotify_listening_history.csv`. This refers to listening recency,
+not release date. Mixed timestamp formats are normalized to UTC; legacy naive
+timestamps are interpreted as UTC. Invalid timestamps are ignored. Ties and
+tracks without usable history retain catalog order, with undated tracks last.
+Only remaining eligible IDs are ranked; `--limit` is applied after ordering.
+
+```powershell
+python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json --recent-first
+```
+
+Use `--history PATH` with `--recent-first` to select another listening CSV with
+`track_id` and `timestamp` columns. Missing files/columns stop before requests or
+checkpoint writes. Add `--dry-run` to preview eligibility and aggregate history
+coverage without requests or writes. History is read in chunks and only the two
+required columns are loaded. The flag changes request order only: existing
+checkpoints remain compatible, completed/unavailable tracks stay skipped, and
+catalog row order and rate limits are preserved. Without the flag, fetching
+retains catalog order. An already-running process picks up this behavior only
+on a subsequent run.
 
 To prioritize basic metadata while deferring year, popularity, ISRC, and date
 precision, use:

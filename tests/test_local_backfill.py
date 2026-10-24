@@ -166,3 +166,157 @@ def test_invalid_or_noncalendar_dates_do_not_create_year_or_precision(tmp_path):
     saved = rows(path)
     assert 'year' not in saved or saved['year'].eq('').all()
     assert 'release_date_precision' not in saved or saved['release_date_precision'].eq('').all()
+
+
+def completed_plays(tid, durations):
+    return [{'spotify_track_uri': f'spotify:track:{tid}',
+             'ts': f'2024-01-01T00:{i:02d}:00Z',
+             'reason_end': 'trackdone', 'ms_played': value}
+            for i, value in enumerate(durations)]
+
+
+def write_audio_history(tmp_path, events, name='test'):
+    path = tmp_path / 'sensitive_info' / 'history' / f'Streaming_History_Audio_{name}.json'
+    path.write_text(json.dumps(events))
+    return path
+
+
+def test_completed_play_estimate_reduces_duration_api_queue_and_is_idempotent(tmp_path):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms,explicit\n{A},,\n')
+    raw = write_audio_history(tmp_path, completed_plays(A, [180000, 180000, 180100, 180000, 90000]))
+    original = raw.read_bytes()
+    before = dm.backfill_metadata(path, fields=['duration_ms'], fetch_only=True, dry_run=True)
+    assert before['api_needed'] == 1
+    preview = dm.backfill_local_metadata(path, source_root=tmp_path, dry_run=True)
+    assert preview['columns'].get('duration_ms', 0) == 1
+    assert rows(path).loc[A, 'duration_ms'] == ''
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == '180000'
+    assert saved.loc[A, 'duration_ms_metadata_source'] == 'history_completed_play_median'
+    assert saved.loc[A, 'duration_ms_is_estimated'] == 'True'
+    assert saved.loc[A, 'duration_ms_estimate_observations'] == '5'
+    assert saved.loc[A, 'duration_ms_estimate_support'] == '4'
+    assert raw.read_bytes() == original
+    assert dm.backfill_metadata(path, fields=['duration_ms'], fetch_only=True,
+                                dry_run=True)['api_needed'] == 0
+    assert dm.backfill_metadata(path, fields=['duration_ms', 'explicit'], fetch_only=True,
+                                dry_run=True)['api_needed'] == 1
+    snapshot = path.read_bytes()
+    assert dm.backfill_local_metadata(path, source_root=tmp_path)['updated_cells'] == 0
+    assert path.read_bytes() == snapshot
+
+
+@pytest.mark.parametrize('durations', [
+    [180000],
+    [180000, 190000],
+    [180000, 180000, 90000],
+    [180000, 180000, 180000, 90000],
+    [0, -1, None, 'NaN', True, 180000.5],
+])
+def test_insufficient_inconsistent_or_invalid_completed_plays_stay_missing(tmp_path, durations):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms\n{A},\n')
+    write_audio_history(tmp_path, completed_plays(A, durations))
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    assert rows(path).loc[A, 'duration_ms'] == ''
+
+
+@pytest.mark.parametrize('durations, expected', [
+    ([180000, 180000], '180000'),
+    ([180000, 180100], '180050'),
+])
+def test_two_agreeing_completed_plays_supply_labelled_median(tmp_path, durations, expected):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms\n{A},\n')
+    write_audio_history(tmp_path, completed_plays(A, durations))
+    result = dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == expected
+    assert saved.loc[A, 'duration_ms_is_estimated'] == 'True'
+    assert saved.loc[A, 'duration_ms_estimate_observations'] == '2'
+    assert saved.loc[A, 'duration_ms_estimate_support'] == '2'
+    assert result['estimated_durations'] == 1
+
+
+def test_duplicate_exports_and_conflicting_event_copies_do_not_inflate_evidence(tmp_path):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms\n{A},\n{B},\n{C},\n')
+    a = completed_plays(A, [180000])
+    b = completed_plays(B, [180000, 180000])
+    c = completed_plays(C, [180000, 180000])
+    write_audio_history(tmp_path, a + b + c, 'one')
+    conflicting = dict(b[0], ms_played=90000)
+    invalid_timestamps = [dict(c[0], ts='bad'), dict(c[0], ts=''), dict(c[0], ts=None)]
+    # Equivalent timezone notation is the same event, not another observation.
+    equivalent = dict(a[0], ts='2024-01-01T00:00:00+00:00')
+    write_audio_history(tmp_path, a + [equivalent, conflicting] + invalid_timestamps, 'two')
+    # No timestamp means no deduplicatable evidence.
+    write_audio_history(tmp_path, [dict(e, ts=None) for e in completed_plays(A, [180000] * 5)], 'three')
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == ''
+    assert saved.loc[B, 'duration_ms'] == ''
+    assert saved.loc[C, 'duration_ms'] == '180000'
+    assert saved.loc[C, 'duration_ms_estimate_observations'] == '2'
+
+
+def test_estimates_preserve_existing_values_and_defer_to_confirmed_cache(tmp_path):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms,duration_ms_metadata_source\n{A},190000,existing\n{B},,\n{C},,\n')
+    write_audio_history(tmp_path, sum((completed_plays(tid, [180000] * 3)
+                                     for tid in (A, B, C, 'unknown')), []))
+    (tmp_path / 'data' / 'basic.spotify-metadata.json').write_text(json.dumps({
+        'version': 1, 'fields': ['duration_ms'], 'records': {B: {'duration_ms': 200000}}}))
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == '190000'
+    assert saved.loc[A, 'duration_ms_metadata_source'] == 'existing'
+    assert saved.loc[B, 'duration_ms'] == '200000'
+    assert saved.loc[B, 'duration_ms_metadata_source'] == 'spotify_cache:basic.spotify-metadata.json'
+    assert saved.loc[B, 'duration_ms_is_estimated'] == ''
+    assert saved.loc[C, 'duration_ms'] == '180000'
+    assert len(saved) == 3
+
+
+def test_skips_and_circular_history_percentages_cannot_supply_estimates(tmp_path):
+    path = setup(tmp_path)
+    path.write_text(f'id,duration_ms\n{A},\n')
+    write_audio_history(tmp_path, [dict(e, reason_end='fwdbtn')
+                                 for e in completed_plays(A, [180000] * 5)])
+    (tmp_path / 'sensitive_info' / 'listening_history.csv').write_text(
+        f'track_id,duration_ms,ms_played,percent_completed\n{A},210000,105000,0.5\n')
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == ''
+    assert saved.loc[A, 'history_duration_candidate_ms'] == '210000'
+
+
+def test_backlog_local_backfill_uses_same_labelled_duration_estimates(tmp_path):
+    setup(tmp_path)
+    path = tmp_path / 'data' / 'dsp_backlog.csv'
+    path.write_text(f'track_id,duration_ms\n{A},\n')
+    write_audio_history(tmp_path, completed_plays(A, [180000] * 2))
+    dm.backfill_local_backlog_metadata(path, source_root=tmp_path)
+    saved = pd.read_csv(path, dtype=str, keep_default_na=False).set_index('track_id')
+    assert saved.loc[A, 'duration_ms'] == '180000'
+    assert saved.loc[A, 'duration_ms_is_estimated'] == 'True'
+
+
+def test_new_estimate_refreshes_orphaned_evidence_for_missing_duration(tmp_path):
+    path = setup(tmp_path)
+    path.write_text('id,duration_ms,duration_ms_is_estimated,duration_ms_estimate_observations,'
+                    'duration_ms_estimate_support\n'
+                    f'{A},,False,20,19\n{B},190000,False,20,19\n')
+    write_audio_history(tmp_path, completed_plays(A, [180000] * 3)
+                        + completed_plays(B, [180000] * 3))
+    dm.backfill_local_metadata(path, source_root=tmp_path)
+    saved = rows(path)
+    assert saved.loc[A, 'duration_ms'] == '180000'
+    assert saved.loc[A, 'duration_ms_is_estimated'] == 'True'
+    assert saved.loc[A, 'duration_ms_estimate_observations'] == '3'
+    assert saved.loc[A, 'duration_ms_estimate_support'] == '3'
+    assert saved.loc[B, 'duration_ms'] == '190000'
+    assert saved.loc[B, 'duration_ms_is_estimated'] == 'False'
+    assert saved.loc[B, 'duration_ms_estimate_observations'] == '20'
