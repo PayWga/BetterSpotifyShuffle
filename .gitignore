@@ -33,7 +33,15 @@ venv/
 # Folders
 sensitive_info
 
+# Local cross-branch development handoff (also covered by sensitive_info above)
+/sensitive_info/BRANCH_HANDOFF.md
+
 # Reproducible test artifacts and downloaded audio
 .pytest_cache/
 .test-runs/
 data/temp_audio/
+
+# Prepared recovery snapshots from blocked atomic CSV replacement
+data/.master_track_table_*.csv
+data/.dsp_backlog_*.csv
+data/*.spotify-metadata.json
