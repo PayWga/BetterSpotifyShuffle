@@ -1,12 +1,22 @@
 
 import argparse
+import json
 import os
-import time
+import tempfile
 from pathlib import Path
 
 import pandas as pd
 import spotipy
+from requests.exceptions import RequestException
 from spotipy.oauth2 import SpotifyOAuth
+from spotipy.cache_handler import CacheFileHandler
+
+if __package__:
+    from . import spotify_metadata
+    from . import local_backfill
+else:
+    import spotify_metadata
+    import local_backfill
 
 # Paths: assumes this file is in the project's scripts/ directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -97,6 +107,59 @@ METADATA_COLUMNS = [
 ]
 
 
+# A measured -1 is impossible in these known nonnegative fields. For key,
+# Spotify's -1 means "no key detected", normalized to this project's NaN.
+# Loudness and local_rms_db are deliberately excluded: -1 dB can be real.
+# Unknown/custom columns and provenance are never interpreted as placeholders.
+PLACEHOLDER_COLUMNS = (
+    BOUNDED_FEATURES + ["tempo"] + DISCRETE_FEATURES
+    + NUMERICAL_FEATURES + BOOLEAN_FEATURES
+    + ["release_year", "local_onset_strength", "local_spectral_centroid",
+       "local_spectral_contrast", "local_beat_regularity"]
+)
+
+
+def clear_feature_placeholders(df):
+    """Return a copy with exact numeric -1 sentinels cleared, plus column counts.
+
+    Numeric conversion is only used for comparison; all other cells keep their
+    original values and representation. No range repair or row pruning occurs.
+    """
+    cleaned = df.copy()
+    counts = {}
+    for column in PLACEHOLDER_COLUMNS:
+        if column not in cleaned:
+            continue
+        missing = pd.to_numeric(cleaned[column], errors="coerce").eq(-1).fillna(False)
+        count = int(missing.sum())
+        if count:
+            cleaned[column] = cleaned[column].mask(missing)
+            counts[column] = count
+    return cleaned, counts
+
+
+def clear_placeholders(master_path=None, dry_run=False):
+    """Clear known -1 placeholders in a master CSV, or report a read-only preview.
+
+    Run only when other catalog writers (including extraction) have stopped.
+    Returns counts of changed cells per column; an unchanged file is not rewritten.
+    """
+    path = Path(MASTER_DB if master_path is None else master_path)
+    # Read text verbatim so labels like 0007 and names like NA survive the rewrite.
+    df = pd.read_csv(path, dtype="string", keep_default_na=False, low_memory=False)
+    if "id" not in df.columns:
+        raise ValueError("Master CSV must have an id column")
+    cleaned, counts = clear_feature_placeholders(df)
+    total = sum(counts.values())
+    if not dry_run and total:
+        save_database(cleaned, path=path)
+    action = "DRY RUN: would clear" if dry_run else "Cleared"
+    print(f"{action} {total} placeholder cells across {len(counts)} columns.")
+    for column, count in counts.items():
+        print(f"  {column}: {count}")
+    return counts
+
+
 
 def normalize_track_ids(df):
     """Normalize the track ID column to 'id'."""
@@ -138,7 +201,7 @@ def normalize_track_ids(df):
 def clean_track_features(df):
     """Clean numerical features while preserving valid values."""
 
-    df = df.copy()
+    df, _ = clear_feature_placeholders(df)
 
     audio_features = CONTINUOUS_FEATURES + DISCRETE_FEATURES
     numeric_columns = audio_features + NUMERICAL_FEATURES
@@ -149,11 +212,6 @@ def clean_track_features(df):
             continue
 
         df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        # Convert legacy unknown indicators for audio
-        # features into NaN.
-        if col in audio_features:
-            df[col] = df[col].replace(-1, float("nan"))
 
     # Validate audio features bounded between 0 and 1
     for col in BOUNDED_FEATURES:
@@ -258,24 +316,94 @@ def merge_track_data(master_df, new_df):
     return combined_df.reset_index()
 
 
-def save_database(df):
+def save_database(df, path=None):
     """Write the master database using an atomic file replacement."""
 
-    MASTER_DB.parent.mkdir(parents=True, exist_ok=True)
-
-    temp_path = MASTER_DB.with_suffix(".tmp.csv")
-
+    path = Path(MASTER_DB if path is None else path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{path.stem}_", suffix=".csv", dir=path.parent)
+    temp_path = Path(temp_name)
     try:
-        df.to_csv(temp_path, index=False)
-        os.replace(temp_path, MASTER_DB)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as output:
+            df.to_csv(output, index=False)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temp_path, path)
 
     finally:
         if temp_path.exists():
             temp_path.unlink()
 
 
+def get_metadata_guard():
+    return spotify_metadata.SpotifyRequestBudget(
+        PRIVATE_DIR / 'spotify_request_budget.json',
+        interval=spotify_metadata.REQUEST_INTERVAL,
+        rest_every=spotify_metadata.REQUEST_REST_EVERY,
+        rest_seconds=spotify_metadata.REQUEST_REST_SECONDS,
+    )
+
+
 def get_spotify_client():
-    return spotipy.Spotify(auth_manager=SpotifyOAuth(scope=SCOPE))
+    """Use the same private credentials/cache as the project's playback tools."""
+    budget = get_metadata_guard()
+    budget.check_allowed()
+    with (PRIVATE_DIR / 'spotify_credentials.json').open(encoding='utf-8') as source:
+        creds = json.load(source)
+    return spotipy.Spotify(auth_manager=SpotifyOAuth(
+        client_id=creds['client_id'], client_secret=creds['client_secret'],
+        redirect_uri=creds['redirect_uri'], scope=SCOPE,
+        cache_handler=CacheFileHandler(cache_path=str(PRIVATE_DIR / '.spotify_cache')),
+    ), requests_session=spotify_metadata.metadata_session(budget),
+        retries=0, status_retries=0, requests_timeout=30)
+
+
+def run_metadata_action(action, *args, **kwargs):
+    """Keep rate-limit exits readable after the action's checkpoint has run."""
+    try:
+        return action(*args, **kwargs)
+    except spotify_metadata.SpotifyBudgetBlocked as exc:
+        print(str(exc))
+        print('Completed checkpoints are retained. Rerun the same command after the cooldown.')
+        raise SystemExit(2) from None
+
+
+def backfill_local_metadata(master_path=None, source_root=None, dry_run=False):
+    return local_backfill.run(MASTER_DB if master_path is None else master_path,
+                              PROJECT_ROOT if source_root is None else source_root,
+                              save_database, dry_run)
+
+
+def backfill_local_backlog_metadata(backlog_path=None, source_root=None, dry_run=False,
+                                   include_checkpoints=False):
+    """Fill backlog search metadata offline; do not open active API checkpoints."""
+    return local_backfill.run(DATA_DIR / 'dsp_backlog.csv' if backlog_path is None else backlog_path,
+                              PROJECT_ROOT if source_root is None else source_root,
+                              save_database, dry_run, target='backlog',
+                              include_checkpoints=include_checkpoints)
+
+
+def backfill_metadata(master_path=None, checkpoint=None, **options):
+    """Fill existing catalog gaps, or stage metadata while extraction runs."""
+    master_path = Path(MASTER_DB if master_path is None else master_path)
+    checkpoint = Path(checkpoint) if checkpoint is not None else master_path.with_suffix('.spotify-metadata.json')
+    if options.get('recent_first') and options.get('history_path') is None:
+        options['history_path'] = HISTORY_DB
+    return spotify_metadata.backfill(master_path, checkpoint, get_spotify_client,
+                                     save_database, **options)
+
+
+def backfill_backlog_metadata(backlog_path=None, **options):
+    """Enrich backlog-only tracks without adding or rewriting master rows."""
+    path = Path(DATA_DIR / 'dsp_backlog.csv' if backlog_path is None else backlog_path)
+    return spotify_metadata.backfill_backlog(path, get_spotify_client, save_database, **options)
+
+
+def apply_metadata_checkpoint(master_path=None, checkpoint=None, dry_run=False):
+    """Run after all other catalog writers have stopped."""
+    master_path = Path(MASTER_DB if master_path is None else master_path)
+    checkpoint = Path(checkpoint) if checkpoint is not None else master_path.with_suffix('.spotify-metadata.json')
+    return spotify_metadata.apply_checkpoint(master_path, checkpoint, save_database, dry_run)
 
 
 def init_database():
@@ -347,123 +475,53 @@ def merge_csv(new_csv_filename):
 
 
 def sync_metadata():
-    """Fetch Spotify metadata for tracks missing from the master DB."""
+    """Add unknown history tracks using the same mapping as metadata backfill.
 
-    print("--- Syncing Missing Tracks from Spotify ---")
-
+    Run only when extraction and other catalog writers have stopped.
+    """
     if not MASTER_DB.exists() or not HISTORY_DB.exists():
         print("Error: Master DB or listening history not found.")
         return
-
-    master_df = pd.read_csv(MASTER_DB, low_memory=False)
-    history_df = pd.read_csv(HISTORY_DB, low_memory=False)
-
-    master_df = normalize_track_ids(master_df)
-
-    if "track_id" not in history_df.columns:
+    master = spotify_metadata.read_catalog(MASTER_DB)
+    history = pd.read_csv(HISTORY_DB, dtype="string", keep_default_na=False)
+    if "track_id" not in history:
         raise ValueError("Listening history must contain 'track_id'.")
-
-    history_ids = set(
-        history_df["track_id"]
-        .dropna()
-        .astype("string")
-        .str.strip()
-    )
-
-    history_ids.discard("")
-
-    known_ids = set(master_df["id"])
-    missing_ids = sorted(history_ids - known_ids)
-
+    missing_ids = sorted(set(history['track_id'].str.strip()) - set(master.index) - {''})
     if not missing_ids:
         print("All tracks in history exist in the master database.")
         return
-
-    print(f"Found {len(missing_ids)} missing tracks.")
-
+    import re
+    records = {}
     sp = get_spotify_client()
-    new_tracks_data = []
 
-    chunk_size = 50
+    def save_records():
+        if records:
+            # Reload before filling gaps to preserve updates made during fetching.
+            current = spotify_metadata.read_catalog(MASTER_DB)
+            spotify_metadata.fill_records(current, records, spotify_metadata.TRACK_FIELDS, allow_new=True)
+            save_database(current.reset_index())
 
-    for i in range(0, len(missing_ids), chunk_size):
-        batch = missing_ids[i:i + chunk_size]
-
+    for tid in missing_ids:
+        if not re.fullmatch(r'[A-Za-z0-9]{22}', tid):
+            continue
         try:
-            results = sp.tracks(batch)
-
-            for track in results.get("tracks", []):
-                if not track or not track.get("id"):
-                    continue
-
-                album = track.get("album") or {}
-                artists = track.get("artists") or []
-
-                release_date = album.get("release_date") or ""
-                year_text = release_date.split("-")[0]
-
-                release_year = (
-                    int(year_text)
-                    if year_text.isdigit()
-                    else None
-                )
-
-                track_data = {
-                    "id": track["id"],
-                    "name": track.get("name"),
-
-                    "artists": ", ".join(
-                        artist["name"]
-                        for artist in artists
-                        if artist.get("name")
-                    ),
-
-                    "artist_ids": ", ".join(
-                        artist["id"]
-                        for artist in artists
-                        if artist.get("id")
-                    ),
-
-                    "album": album.get("name"),
-                    "album_id": album.get("id"),
-
-                    "release_date": release_date or None,
-                    "year": release_year,
-
-                    "duration_ms": track.get("duration_ms"),
-                    "explicit": track.get("explicit"),
-
-                    "track_number": track.get("track_number"),
-                    "disc_number": track.get("disc_number")
-                }
-
-                new_tracks_data.append(track_data)
-
-            print(
-                f"Fetched batch {i // chunk_size + 1}: "
-                f"{min(i + chunk_size, len(missing_ids))}"
-                f"/{len(missing_ids)}"
-            )
-
-            time.sleep(0.5)
-
-        except Exception as e:
-            print(f"API error on batch {i // chunk_size + 1}: {e}")
-            time.sleep(5)
-
-    if not new_tracks_data:
+            record = spotify_metadata.fetch_track(sp, tid)
+            if record:
+                records[tid] = record
+        except spotify_metadata.SpotifyBudgetBlocked:
+            save_records()
+            raise
+        except spotipy.SpotifyException as exc:
+            if exc.http_status in (401, 403):
+                raise
+            print(f"Track metadata unavailable (HTTP {exc.http_status}).")
+        except RequestException:
+            print('Track metadata request failed after retries; rerun --sync to retry.')
+    if not records:
         print("No metadata was retrieved.")
         return
-
-    new_df = pd.DataFrame(new_tracks_data)
-
-    combined_df = merge_track_data(master_df, new_df)
-
-    save_database(combined_df)
-
-    print(f"SUCCESS: Added metadata for {len(new_tracks_data)} tracks.")
-    print(f"Master database contains {len(combined_df)} tracks.")
-
+    save_records()
+    print(f"SUCCESS: Retrieved metadata for {len(records)} tracks.")
 
 
 def repair_database():
@@ -496,24 +554,93 @@ def repair_database():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Spotify Offline Track Features Database Manager")
-    parser.add_argument("--init", action="store_true", help="Initialize the Master DB from the Kaggle dataset")
-    parser.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
-    parser.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
-    parser.add_argument("--repair", action="store_true", help="Format missing data for PyTorch <UNK> processing")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--init", action="store_true", help="Initialize the Master DB from the Kaggle dataset")
+    actions.add_argument("--merge", type=str, metavar="FILENAME", help="Merge an external CSV dataset into the Master DB")
+    actions.add_argument("--sync", action="store_true", help="Fetch basic metadata for unknown tracks in your history")
+    actions.add_argument("--backfill", action="store_true", help="Fill missing Spotify metadata for existing master tracks")
+    actions.add_argument("--backfill-local", action="store_true", help="Fill missing master metadata from local aliases, history, and saved Spotify data; no API calls")
+    actions.add_argument('--backfill-backlog-local', action='store_true', help='Fill missing backlog metadata from local history/master; no API calls or checkpoint reads by default')
+    actions.add_argument("--backfill-backlog", action="store_true", help="Fill missing duration/recording metadata directly in the audio backlog")
+    actions.add_argument("--apply-backfill", action="store_true", help="Apply a metadata checkpoint after other catalog writers stop")
+    actions.add_argument("--repair", action="store_true", help="Clean identifiers, duplicates, and invalid feature values")
+    actions.add_argument("--clear-placeholders", action="store_true", help="Convert exact -1 sentinels in known nonnegative columns to NaN")
+    actions.add_argument("--spotify-budget-status", action="store_true", help="Show local request-budget/cooldown status without calling Spotify")
+    actions.add_argument("--set-spotify-cooldown", type=float, metavar="SECONDS", help="Persist a known cooldown without making API calls; never shortens an existing pause")
+    parser.add_argument("--master", type=Path, help="Master CSV for placeholder cleanup or metadata backfill")
+    parser.add_argument("--local-source-root", type=Path, help="Project root containing data/ and sensitive_info/ for --backfill-local")
+    parser.add_argument('--include-local-checkpoints', action='store_true', help='Also read saved Spotify checkpoints during --backfill-backlog-local; use only after fetch jobs finish')
+    parser.add_argument("--backlog", type=Path, help="Backlog CSV for --backfill-backlog")
+    parser.add_argument("--dry-run", action="store_true", help="Preview cleanup/backfill/apply without writing or API requests")
+    parser.add_argument("--checkpoint", type=Path, help="Resumable metadata JSON (default: beside the selected master)")
+    parser.add_argument("--fetch-only", action="store_true", help="Fetch to checkpoint only; safe while extraction runs")
+    parser.add_argument('--recent-first', action='store_true', help='Prioritize tracks listened to most recently in the remaining backfill queue')
+    parser.add_argument('--history', type=Path, help='Listening CSV with track_id and timestamp for --recent-first (default: sensitive_info/spotify_listening_history.csv)')
+    parser.add_argument("--limit", type=int, help="Maximum new tracks to check in this backfill run")
+    parser.add_argument("--fields", nargs='+', help="Only backfill these supported metadata columns")
+    parser.add_argument("--extra-metadata", action="store_true", help="Also fetch album label and artist_genres, with cached album/artist requests")
     
     args = parser.parse_args()
+    if args.recent_first and not args.backfill:
+        parser.error('--recent-first requires --backfill')
+    if args.history is not None and not args.recent_first:
+        parser.error('--history requires --recent-first')
+    enrichment = args.backfill or args.apply_backfill
+    if args.local_source_root is not None and not (args.backfill_local or args.backfill_backlog_local):
+        parser.error('--local-source-root requires --backfill-local or --backfill-backlog-local')
+    if args.include_local_checkpoints and not args.backfill_backlog_local:
+        parser.error('--include-local-checkpoints requires --backfill-backlog-local')
+    if args.master is not None and not (args.clear_placeholders or enrichment or args.backfill_local):
+        parser.error("--master and --dry-run require --clear-placeholders, --backfill, or --apply-backfill")
+    if args.dry_run and not (args.clear_placeholders or enrichment or args.backfill_backlog or args.backfill_local or args.backfill_backlog_local):
+        parser.error("--dry-run requires a cleanup or metadata action")
+    if args.backlog is not None and not (args.backfill_backlog or args.backfill_backlog_local):
+        parser.error('--backlog requires --backfill-backlog or --backfill-backlog-local')
+    if args.checkpoint is not None and not enrichment:
+        parser.error("--checkpoint requires --backfill or --apply-backfill")
+    if (args.fetch_only or args.fields or args.extra_metadata) and not args.backfill:
+        parser.error("--fetch-only, --limit, --fields, and --extra-metadata require --backfill")
+    if args.limit is not None and not (args.backfill or args.backfill_backlog):
+        parser.error("--limit requires --backfill or --backfill-backlog")
+    if args.limit is not None and args.limit <= 0:
+        parser.error("--limit must be positive")
     
-    if args.init:
+    if args.spotify_budget_status:
+        print(json.dumps(get_metadata_guard().summary(), indent=2))
+    elif args.set_spotify_cooldown is not None:
+        budget = get_metadata_guard()
+        budget.pause(args.set_spotify_cooldown)
+        print(json.dumps(budget.summary(), indent=2))
+    elif args.init:
         init_database()
     elif args.merge:
         merge_csv(args.merge)
     elif args.sync:
-        sync_metadata()
+        run_metadata_action(sync_metadata)
+    elif args.backfill:
+        run_metadata_action(backfill_metadata, args.master, args.checkpoint, dry_run=args.dry_run,
+                          fetch_only=args.fetch_only, limit=args.limit,
+                          fields=args.fields, extra_metadata=args.extra_metadata,
+                          recent_first=args.recent_first, history_path=args.history)
+    elif args.backfill_local:
+        backfill_local_metadata(args.master, args.local_source_root, args.dry_run)
+    elif args.backfill_backlog_local:
+        backfill_local_backlog_metadata(args.backlog, args.local_source_root, args.dry_run,
+                                       args.include_local_checkpoints)
+    elif args.backfill_backlog:
+        run_metadata_action(backfill_backlog_metadata, args.backlog, dry_run=args.dry_run, limit=args.limit)
+    elif args.apply_backfill:
+        apply_metadata_checkpoint(args.master, args.checkpoint, args.dry_run)
     elif args.repair:
         repair_database()
+    elif args.clear_placeholders:
+        clear_placeholders(args.master, args.dry_run)
     else:
         print("Please specify an action. Usage examples:")
         print("  python.exe data_manager.py --init")
         print("  python.exe data_manager.py --merge workout_songs.csv")
         print("  python data_manager.py --sync")
         print("  python data_manager.py --repair")
+        print("  python scripts/data_merging.py --clear-placeholders --dry-run")
+        print("  python scripts/data_merging.py --backfill --fetch-only")
+        print("  python scripts/data_merging.py --apply-backfill")

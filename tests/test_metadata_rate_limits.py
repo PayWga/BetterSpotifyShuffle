@@ -1,0 +1,235 @@
+"""Rate limits stop the whole metadata job without spending track attempts."""
+import json
+from types import SimpleNamespace
+
+import pandas as pd
+import pytest
+from spotipy.exceptions import SpotifyException
+
+from scripts import data_merging as dm
+from scripts import spotify_metadata as sm
+
+
+@pytest.fixture(autouse=True)
+def no_wait(monkeypatch):
+    waits = []
+    now = [0.0]
+    def sleep(seconds):
+        waits.append(seconds)
+        now[0] += seconds
+    monkeypatch.setattr(sm, 'time', SimpleNamespace(monotonic=lambda: now[0], sleep=sleep))
+    # Reset process pacing between independent tests without touching live state.
+    monkeypatch.setattr(sm, '_last_request_started', None, raising=False)
+    return waits
+
+
+@pytest.mark.parametrize('header', ['86160', None, 'invalid', '-1', 'nan', 'inf'])
+def test_long_or_unknown_limit_stops_without_retry(header, no_wait):
+    calls = []
+    def limited():
+        calls.append(1)
+        raise SpotifyException(429, -1, 'synthetic', headers={} if header is None else {'retry-after': header})
+    with pytest.raises(sm.SpotifyCooldown) as caught:
+        sm.request(limited)
+    assert len(calls) == 1
+    assert not no_wait
+    if header == '86160':
+        assert caught.value.retry_after == 86160
+        assert caught.value.retry_at.tzinfo is not None
+        assert 'UTC' in str(caught.value)
+    else:
+        assert caught.value.retry_at is None
+
+
+def test_short_limit_stops_immediately_without_probe_retry(no_wait):
+    calls = []
+    def fetch():
+        calls.append(1)
+        if len(calls) == 1:
+            raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '2'})
+        return 'ok'
+    with pytest.raises(sm.SpotifyCooldown):
+        sm.request(fetch)
+    assert len(calls) == 1
+    assert no_wait == []
+
+
+def test_repeated_short_limits_stop_instead_of_moving_to_next_track(no_wait):
+    calls = []
+    def limited():
+        calls.append(1)
+        raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '2'})
+    with pytest.raises(sm.SpotifyCooldown):
+        sm.request(limited)
+    assert len(calls) == 1
+    assert no_wait == []
+
+
+@pytest.mark.parametrize('kind', ['backlog', 'master'])
+def test_limit_checkpoints_completed_work_and_never_requests_later_tracks(tmp_path, kind):
+    ids = ['A' * 22, 'B' * 22, 'C' * 22]
+    path = tmp_path / 'catalog.csv'
+    path.write_text(('track_id,attempts,last_error\n' if kind == 'backlog' else 'id,attempts,last_error\n')
+                    + ''.join(f'{tid},4,no_matching_recording\n' for tid in ids), encoding='utf-8')
+    class Spotify:
+        calls = []
+        def track(self, tid):
+            self.calls.append(tid)
+            if tid == ids[1]:
+                raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '86160'})
+            return {'id': tid, 'name': 'Song', 'duration_ms': 180000, 'artists': [{'name': 'Artist'}]}
+    sp = Spotify()
+    checkpoint = tmp_path / 'checkpoint.json'
+    with pytest.raises(sm.SpotifyCooldown):
+        if kind == 'backlog':
+            dm.backfill_backlog_metadata(path, sp=sp)
+        else:
+            dm.backfill_metadata(path, checkpoint, sp=sp)
+    assert sp.calls == ids[:2]
+    rows = pd.read_csv(path, dtype=str, keep_default_na=False)
+    assert list(rows['attempts']) == ['4'] * 3
+    assert list(rows['last_error']) == ['no_matching_recording'] * 3
+    if kind == 'backlog':
+        assert rows.iloc[0]['duration_ms'] == '180000'
+        assert rows.iloc[1]['duration_ms'] == ''
+    else:
+        assert json.loads(checkpoint.read_text())['records'][ids[0]]['duration_ms'] == 180000
+
+
+def test_metadata_transport_preserves_429_response_headers():
+    session = sm.metadata_session()
+    try:
+        for scheme in ('https://', 'http://'):
+            retry = session.get_adapter(scheme).max_retries
+            assert retry.total == 0
+            assert retry.raise_on_status is False
+    finally:
+        session.close()
+
+
+def test_spotipy_receives_original_429_headers_without_network(monkeypatch):
+    from io import BytesIO
+    import spotipy
+    from urllib3.connectionpool import HTTPConnectionPool
+    from urllib3.response import HTTPResponse
+
+    def response(*args, **kwargs):
+        return HTTPResponse(body=BytesIO(b'{"error":{"status":429,"message":"synthetic"}}'),
+                            status=429, headers={'Retry-After': '86160'}, preload_content=False)
+    monkeypatch.setattr(HTTPConnectionPool, '_make_request', response)
+    session = sm.metadata_session()
+    session.trust_env = False
+    client = spotipy.Spotify(auth='synthetic', requests_session=session)
+    try:
+        with pytest.raises(sm.SpotifyCooldown) as caught:
+            sm.request(lambda: client._internal_call('GET', 'http://offline.invalid/test', None, {}))
+        assert caught.value.retry_after == 86160
+    finally:
+        session.close()
+
+
+def test_cli_rate_limit_exit_is_readable_and_nonzero(capsys):
+    def stopped():
+        raise sm.SpotifyCooldown(86160)
+    with pytest.raises(SystemExit) as caught:
+        dm.run_metadata_action(stopped)
+    assert caught.value.code == 2
+    message = capsys.readouterr().out
+    assert 'UTC' in message
+    assert 'checkpoints are retained' in message
+
+
+def test_client_factory_uses_header_preserving_session(tmp_path, monkeypatch):
+    (tmp_path / 'spotify_credentials.json').write_text(json.dumps({
+        'client_id': 'synthetic', 'client_secret': 'synthetic', 'redirect_uri': 'http://localhost'}))
+    monkeypatch.setattr(dm, 'PRIVATE_DIR', tmp_path)
+    monkeypatch.setattr(dm, 'SpotifyOAuth', lambda **kwargs: object())
+    client = dm.get_spotify_client()
+    try:
+        assert client._session.get_adapter('https://').max_retries.raise_on_status is False
+    finally:
+        client._session.close()
+
+
+def test_sync_preserves_successes_before_cooldown(tmp_path, monkeypatch):
+    ids = ['A' * 22, 'B' * 22, 'C' * 22]
+    master, history = tmp_path / 'master.csv', tmp_path / 'history.csv'
+    master.write_text('id,name,tempo\nexisting,Keep,120\n')
+    history.write_text('track_id\n' + '\n'.join(ids) + '\n')
+    class Spotify:
+        calls = []
+        def track(self, tid):
+            self.calls.append(tid)
+            if tid == ids[1]:
+                raise SpotifyException(429, -1, 'synthetic', headers={'Retry-After': '86160'})
+            return {'id': tid, 'name': 'Song', 'duration_ms': 180000}
+    sp = Spotify()
+    monkeypatch.setattr(dm, 'MASTER_DB', master)
+    monkeypatch.setattr(dm, 'HISTORY_DB', history)
+    monkeypatch.setattr(dm, 'get_spotify_client', lambda: sp)
+    with pytest.raises(sm.SpotifyCooldown):
+        dm.sync_metadata()
+    rows = pd.read_csv(master, dtype=str, keep_default_na=False).set_index('id')
+    assert rows.loc[ids[0], 'name'] == 'Song'
+    assert ids[1] not in rows.index
+    assert rows.loc['existing', 'tempo'] == '120'
+    assert sp.calls == ids[:2]
+
+
+def test_successful_requests_are_spaced_before_each_attempt(no_wait):
+    starts = []
+    for _ in range(3):
+        sm.request(lambda: starts.append(sm.time.monotonic()))
+    assert starts == [0, 10, 20]
+
+
+def test_not_found_requests_do_not_bypass_pacing(no_wait):
+    starts = []
+    def missing():
+        starts.append(sm.time.monotonic())
+        raise SpotifyException(404, -1, 'missing')
+    for _ in range(3):
+        with pytest.raises(SpotifyException):
+            sm.request(missing)
+    assert starts == [0, 10, 20]
+
+
+@pytest.mark.parametrize('failure', ['server', 'network'])
+def test_retries_obey_minimum_spacing(no_wait, failure):
+    from requests.exceptions import Timeout
+    starts = []
+    def fetch():
+        starts.append(sm.time.monotonic())
+        if len(starts) == 1:
+            if failure == 'network':
+                raise Timeout('synthetic')
+            raise SpotifyException(503, -1, 'synthetic', headers={'Retry-After': '0'})
+        return 'ok'
+    assert sm.request(fetch) == 'ok'
+    assert starts == [0, 10]
+
+
+def test_slow_request_does_not_add_unnecessary_wait(no_wait):
+    starts = []
+    def slow():
+        starts.append(sm.time.monotonic())
+        sm.time.sleep(12)
+    sm.request(slow)
+    sm.request(lambda: starts.append(sm.time.monotonic()))
+    assert starts == [0, 12]
+
+
+def test_track_album_and_artist_share_request_pacing(no_wait):
+    starts = []
+    class Spotify:
+        def track(self, tid):
+            starts.append(sm.time.monotonic())
+            return {'id': tid, 'album': {'id': 'album'}, 'artists': [{'id': 'artist'}]}
+        def album(self, aid):
+            starts.append(sm.time.monotonic())
+            return {'label': 'Label'}
+        def artist(self, aid):
+            starts.append(sm.time.monotonic())
+            return {'genres': ['rock']}
+    assert sm.fetch_track(Spotify(), 'A' * 22, extra_metadata=True)['label'] == 'Label'
+    assert starts == [0, 10, 20]
