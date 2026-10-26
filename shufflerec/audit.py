@@ -9,7 +9,7 @@ import pandas as pd
 from .features import AUDIO, EXTRACTED, LOCAL, FeaturePreprocessor, first_present, series
 
 CATALOG_COLUMNS = set(AUDIO + ('id', 'key', 'time_signature', 'artists', 'artist_name',
-    'artist_ids', 'year', 'release_year', 'release_date', 'duration_ms', 'track_genre',
+    'artist_ids', 'year', 'release_year', 'release_date', 'duration_ms', 'duration_ms_is_estimated', 'track_genre',
     'genre', 'artist_genres', 'album_id', 'popularity') + LOCAL)
 CATALOG_COLUMNS.update(name + suffix for name in EXTRACTED for suffix in ('_source', '_analysis_seconds'))
 

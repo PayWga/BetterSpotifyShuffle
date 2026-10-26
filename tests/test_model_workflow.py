@@ -47,11 +47,15 @@ def test_comparison_shares_validation_cases_and_leaves_test_untouched():
     variants={'audio':FeatureConfig(artist=False,year=False,duration=False,genre=False,artist_genre=False,local=False,provenance=False),
               'metadata':FeatureConfig(local=False,provenance=False)}
     result=m.run_comparison(catalog,history,variants=variants,model_config=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0),
-                            epochs=1,preference_epochs=0,num_negatives=1,max_examples=2,seed=8)
+                            epochs=1,preference_epochs=0,num_negatives=1,max_examples=2,seed=8,
+                            learning_rate=0.002,preference_learning_rate=0.0002,patience=2)
     assert len(result)==2
     assert result[0]['evaluation_fingerprint']==result[1]['evaluation_fingerprint']
     assert all(r['test_evaluated'] is False for r in result)
     assert all(r['validation']['examples']==2 for r in result)
+    assert all(r['training_options']['learning_rate']==0.002 for r in result)
+    assert all(r['training_options']['patience']==2 for r in result)
+    assert all(r['history'][0]['phase']=='next_item' for r in result)
 
 
 def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(tmp_path,monkeypatch):
@@ -74,9 +78,63 @@ def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(t
         exec(compile(source,'ShuffleRec.ipynb','exec'),ns)
         if 'RUN_TRAINING = False' in source:
             ns['RUN_TRAINING']=True
+            ns['RUN_COMPARISON']=False
             ns['TRAINING_OPTIONS'].update(epochs=1,preference_epochs=0,batch_size=16)
             ns['MODEL_CONFIG']=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0)
             ns['NUM_NEGATIVES']=1
     assert ns['training_result']['test_evaluated'] is False
     assert (master.read_bytes(),hist.read_bytes())==before
     assert list((project/'sensitive_info/model_runs').glob('*/model.pt'))
+
+
+def test_notebook_comparison_uses_custom_variants_options_and_saves_results(tmp_path,monkeypatch):
+    from pathlib import Path
+    nb=json.loads(Path('notebooks/ShuffleRec.ipynb').read_text(encoding='utf-8'))
+    project=tmp_path/'project';(project/'data').mkdir(parents=True)
+    (project/'sensitive_info').mkdir();(project/'shufflerec').mkdir()
+    frame=pd.DataFrame([dict(id=t,artists=t,tempo=100+i*10,duration_ms=100000+i*1000,
+                             duration_ms_is_estimated=(t=='d')) for i,t in enumerate('abcd')])
+    history=pd.DataFrame([dict(track_id=t,event_type='NEUTRAL' if t=='d' else 'PLAY',
+                              timestamp=f'2020-01-{day:02d}T00:0{i}:00Z')
+                          for day in range(1,11) for i,t in enumerate('abcd')])
+    master=project/'data/master_track_table.csv';hist=project/'sensitive_info/spotify_listening_history.csv'
+    frame.to_csv(master,index=False);history.to_csv(hist,index=False)
+    before=(master.read_bytes(),hist.read_bytes());monkeypatch.chdir(project)
+    ns={}
+    for cell in nb['cells']:
+        if cell['cell_type']!='code':continue
+        source=''.join(cell['source']);exec(compile(source,'notebook-comparison','exec'),ns)
+        if 'RUN_TRAINING = False' in source:
+            ns.update(RUN_TRAINING=False,RUN_COMPARISON=True,RUN_AUDIT=False,NUM_NEGATIVES=1,MAX_EVAL_EXAMPLES=2)
+            ns['TRAINING_OPTIONS'].update(epochs=1,preference_epochs=0,batch_size=16,learning_rate=0.002,patience=2)
+            ns['MODEL_CONFIG']=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0)
+            ns['COMPARISON_VARIANTS']={'artist_only':FeatureConfig(local=False,provenance=False)}
+    assert [r['variant'] for r in ns['comparison_results']]==['artist_only']
+    assert ns['comparison_results'][0]['training_options']['learning_rate']==0.002
+    reports=list((project/'sensitive_info/model_runs').glob('*/comparison_results.json'))
+    assert len(reports)==1
+    saved=json.loads(reports[0].read_text(encoding='utf-8'))
+    assert saved['results'][0]['test_evaluated'] is False
+    assert saved['candidate_scope']=='history'
+    assert (master.read_bytes(),hist.read_bytes())==before
+
+
+def test_individual_local_variants_change_exactly_one_local_measurement():
+    m=comparison_api()
+    variants=m.individual_local_variants()
+    assert len(variants)==6
+    baseline=variants['no_local']
+    assert baseline.enabled_local_features==()
+    for feature in ('local_rms_db','local_onset_strength','local_spectral_centroid',
+                    'local_spectral_contrast','local_beat_regularity'):
+        config=variants['add_'+feature]
+        assert config.enabled_local_features==(feature,)
+        assert config.provenance==baseline.provenance
+
+
+def test_estimated_duration_variants_make_policy_choice_explicit():
+    m=comparison_api();variants=m.estimated_duration_variants()
+    assert len(variants)==2
+    assert variants['without_estimated_durations'].include_estimated_durations is False
+    assert variants['with_estimated_durations'].include_estimated_durations is True
+    assert all(config.duration for config in variants.values())

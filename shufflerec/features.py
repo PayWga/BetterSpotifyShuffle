@@ -35,6 +35,18 @@ class FeatureConfig:
     key_encoding: str = 'circular'
     time_signature_encoding: str = 'categorical'
     max_labels: int = 16
+    local_rms_db: bool = True
+    local_onset_strength: bool = True
+    local_spectral_centroid: bool = True
+    local_spectral_contrast: bool = True
+    local_beat_regularity: bool = True
+    include_estimated_durations: bool = False
+
+    @property
+    def enabled_local_features(self):
+        # Keep the old aggregate gate for saved configurations and callers;
+        # each measurement now also has its own independent switch.
+        return tuple(name for name in LOCAL if self.local and getattr(self, name))
 
     def __post_init__(self):
         if self.key_encoding not in ('raw', 'circular'):
@@ -102,6 +114,7 @@ class FeaturePreprocessor:
         self.artist_aliases = {}
         self.numeric_names = []
         self.fitted = False
+        self.duration_policy = 'include_estimated' if self.config.include_estimated_durations else 'exclude_estimated'
 
     def _numeric(self, frame):
         names = list(AUDIO)
@@ -110,8 +123,7 @@ class FeaturePreprocessor:
             names.append('time_signature')
         names += [name for enabled, name in ((self.config.year, 'year'),
                   (self.config.duration, 'duration_ms'), (self.config.popularity, 'popularity')) if enabled]
-        if self.config.local:
-            names.extend(LOCAL)
+        names.extend(self.config.enabled_local_features)
         values = pd.DataFrame(index=frame.index)
         for name in names:
             values[name] = pd.to_numeric(series(frame, name), errors='coerce')
@@ -153,8 +165,17 @@ class FeaturePreprocessor:
             if name == 'time_signature':
                 valid &= v.mod(1).eq(0)
             values[name] = v.where(valid)
+        if self.config.duration:
+            text = series(frame, 'duration_ms_is_estimated').astype('string').str.strip().str.casefold()
+            estimated = text.map({'true': 1., '1': 1., '1.0': 1., 'false': 0., '0': 0., '0.0': 0.})
+            if self.duration_policy == 'exclude_estimated':
+                values['duration_ms'] = values['duration_ms'].mask(estimated.eq(1))
+            elif self.duration_policy == 'include_estimated':
+                # Unknown source status remains missing; unflagged never means
+                # independently verified. Invalid/missing duration stays missing.
+                values['duration_ms_is_estimated'] = estimated.where(values['duration_ms'].notna())
         if self.config.provenance:
-            for name in EXTRACTED if self.config.local else EXTRACTED[:3]:
+            for name in EXTRACTED[:3] + self.config.enabled_local_features:
                 raw = pd.to_numeric(series(frame, name), errors='coerce')
                 observed = raw.notna() & np.isfinite(raw)
                 if name in values:
@@ -226,7 +247,7 @@ class FeaturePreprocessor:
         values = self._numeric(train)
         self.numeric_names = list(values)
         self.scales = {}
-        fixed = set(BOUNDED) | {'mode', 'key', 'key_sin', 'key_cos'}
+        fixed = set(BOUNDED) | {'mode', 'key', 'key_sin', 'key_cos', 'duration_ms_is_estimated'}
         for name in values:
             if name not in fixed and not name.endswith('_is_local') and values[name].notna().any():
                 self.scales[name] = [float(values[name].min()), float(values[name].max())]
@@ -241,7 +262,7 @@ class FeaturePreprocessor:
         frame = clean_catalog(frame)
         values = self._numeric(frame)[self.numeric_names]
         mask = values.notna().to_numpy(dtype=np.float32)
-        fixed = set(BOUNDED) | {'mode', 'key', 'key_sin', 'key_cos'}
+        fixed = set(BOUNDED) | {'mode', 'key', 'key_sin', 'key_cos', 'duration_ms_is_estimated'}
         for name in values:
             if name in self.scales:
                 lo, hi = self.scales[name]
@@ -266,13 +287,17 @@ class FeaturePreprocessor:
         if not self.fitted:
             raise ValueError('Preprocessor has not been fitted')
         return dict(version=SCHEMA_VERSION, config=asdict(self.config), numeric_names=self.numeric_names,
-                    vocabularies=self.vocabularies, scales=self.scales, artist_aliases=self.artist_aliases)
+                    vocabularies=self.vocabularies, scales=self.scales, artist_aliases=self.artist_aliases,
+                    duration_policy=self.duration_policy)
 
     @classmethod
     def from_state_dict(cls, state):
         if state.get('version') != SCHEMA_VERSION:
             raise ValueError('Unsupported preprocessing schema version')
         obj = cls(FeatureConfig(**state['config']))
+        obj.duration_policy = state.get('duration_policy', 'legacy')
+        if obj.duration_policy not in ('exclude_estimated', 'include_estimated', 'legacy'):
+            raise ValueError('Unsupported duration policy')
         for name in ('numeric_names', 'vocabularies', 'scales', 'artist_aliases'):
             setattr(obj, name, state[name])
         obj.fitted = True

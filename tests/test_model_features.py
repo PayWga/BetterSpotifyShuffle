@@ -113,3 +113,75 @@ def test_invalid_year_can_use_valid_alias_but_invalid_calendar_date_stays_missin
     assert p.scales['year']==[2001,2021]
     values=p.transform(frame);i=p.numeric_names.index('year')
     assert values['numeric_mask'][:,i].tolist()==[1,0,1]
+
+
+@pytest.mark.parametrize('flag',[True, 'True', 'true', 1, '1.0'])
+def test_estimated_durations_are_unavailable_without_dropping_the_track(tmp_path, flag):
+    m=api(); from shufflerec.audit import read_catalog
+    frame=pd.DataFrame([dict(id='confirmed',duration_ms=100000,artists='A'),
+                        dict(id='estimated',duration_ms=900000,duration_ms_is_estimated=flag,artists='B')])
+    path=tmp_path/'catalog.csv';frame.to_csv(path,index=False)
+    loaded=read_catalog(path)
+    p=m.FeaturePreprocessor().fit(loaded,['confirmed','estimated'])
+    i=p.numeric_names.index('duration_ms');batch=p.transform(loaded)
+    assert batch['numeric_mask'][:,i].tolist()==[1,0]
+    assert p.scales['duration_ms']==[100000,100000]
+    assert batch['artist_mask'][1,0]==1
+    assert len(loaded)==2
+
+
+def test_duration_policy_is_saved_and_legacy_artifacts_keep_their_original_transform():
+    m=api(); frame=pd.DataFrame([dict(id='a',duration_ms=100000),
+                                dict(id='b',duration_ms=200000,duration_ms_is_estimated=True)])
+    p=m.FeaturePreprocessor().fit(frame,['a','b'])
+    state=p.state_dict()
+    assert state['duration_policy']=='exclude_estimated'
+    i=p.numeric_names.index('duration_ms')
+    assert m.FeaturePreprocessor.from_state_dict(state).transform(frame)['numeric_mask'][1,i]==0
+    legacy=dict(state);legacy.pop('duration_policy')
+    legacy['scales']={**legacy['scales'],'duration_ms':[100000,200000]}
+    values=m.FeaturePreprocessor.from_state_dict(legacy).transform(frame)
+    assert values['numeric_mask'][1,i]==1
+    assert values['numeric'][1,i]==1
+
+
+@pytest.mark.parametrize('feature',['local_rms_db','local_onset_strength','local_spectral_centroid',
+                                    'local_spectral_contrast','local_beat_regularity'])
+def test_local_measurement_and_its_provenance_can_be_disabled_independently(feature):
+    m=api()
+    config=m.FeatureConfig(**{feature:False})
+    frame=catalog()
+    for name,value in [('local_rms_db',-20),('local_onset_strength',1),('local_spectral_centroid',1000),
+                       ('local_spectral_contrast',10),('local_beat_regularity',0.5)]:
+        frame[name]=value;frame[name+'_source']='librosa_acoustics_v1';frame[name+'_analysis_seconds']=60
+    p=m.FeaturePreprocessor(config).fit(frame,['a','b'])
+    assert feature not in p.numeric_names
+    assert feature+'_is_local' not in p.numeric_names
+    assert feature+'_analysis_seconds' not in p.numeric_names
+    assert all(name in p.numeric_names for name in m.LOCAL if name!=feature)
+
+
+def test_estimated_durations_can_be_included_with_an_explicit_unknown_aware_indicator(tmp_path):
+    m=api()
+    frame=pd.DataFrame([dict(id='confirmed',duration_ms=100000,duration_ms_is_estimated=False),
+                        dict(id='estimated',duration_ms=200000,duration_ms_is_estimated=True),
+                        dict(id='unknown',duration_ms=150000),
+                        dict(id='missing',duration_ms_is_estimated=True)])
+    config=m.FeatureConfig(include_estimated_durations=True)
+    p=m.FeaturePreprocessor(config).fit(frame,['confirmed','estimated','unknown','missing'])
+    batch=p.transform(frame);duration=p.numeric_names.index('duration_ms')
+    flag=p.numeric_names.index('duration_ms_is_estimated')
+    assert batch['numeric_mask'][:,duration].tolist()==[1,1,1,0]
+    assert batch['numeric'][:,flag].tolist()==[0,1,0,0]
+    assert batch['numeric_mask'][:,flag].tolist()==[1,1,0,0]
+    path=tmp_path/'include-estimated.json';p.save(path)
+    restored=m.FeaturePreprocessor.load(path)
+    assert restored.duration_policy=='include_estimated'
+    for name,values in batch.items():
+        np.testing.assert_array_equal(values,restored.transform(frame)[name])
+
+
+def test_estimate_indicator_is_not_minmax_scaled_when_only_estimates_are_observed():
+    m=api();frame=pd.DataFrame([dict(id='a',duration_ms=100000,duration_ms_is_estimated=True)])
+    p=m.FeaturePreprocessor(m.FeatureConfig(include_estimated_durations=True)).fit(frame,['a'])
+    assert p.transform(frame)['numeric'][0,p.numeric_names.index('duration_ms_is_estimated')]==1

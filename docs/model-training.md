@@ -28,7 +28,18 @@ Album display names are not used as IDs because they can collide across artists.
 
 Track genres and artist genres use distinct vocabularies. Artist genre labels
 are not substituted for a missing track genre. `history_duration_candidate_ms`
-is deliberately ignored. Year can describe a reissue rather than an original
+is deliberately ignored. New preprocessing also masks durations explicitly
+marked `duration_ms_is_estimated=True`; other track features remain eligible.
+This duration policy is serialized with preprocessing. Older artifacts without
+the policy field retain their legacy duration transformation when loaded.
+`include_estimated_durations=True` opts into using flagged estimates and adds a
+separate binary `duration_ms_is_estimated` input with an availability mask.
+Unknown estimate status remains unknown; invalid/missing duration stays missing.
+This opt-in uses the estimates already in the snapshot. They may incorporate
+held-out listening events: it is exploratory, not a claim of point-in-time
+duration estimation. Strict chronological experiments would need estimates
+recomputed from pre-cutoff evidence only.
+Year can describe a reissue rather than an original
 recording. Positive/negative acoustic values are validated according to their
 meaning: -1 dB RMS/loudness can be real; -1 key/duration cannot.
 
@@ -78,18 +89,33 @@ different devices/backends are not promised.
 
 ## Run controls and artifacts
 
-- `RUN_AUDIT=True` performs a read-only aggregate scan.
-- `RUN_TRAINING=False` by default. Preparation displays partition counts,
-  candidate coverage and actual parameter costs before optimization.
-- `RUN_COMPARISON=False` by default. Enable separately to run audio, metadata,
+- `RUN_AUDIT=False` currently skips repeating the read-only aggregate scan.
+- `RUN_TRAINING=False` skips the separate single-model experiment. Enable it to
+  train using `FEATURE_CONFIG`; it does not select comparison variants.
+- `RUN_COMPARISON=True` currently configures the notebook to run audio, metadata,
   compact encoding, and local-acoustic variants. All share common validation
   contexts/targets/candidates, and each reports its training coverage. Models
   are built sequentially to avoid storing several catalog-sized tensors.
+  `COMPARISON_MODE="individual_local"` is now the default: running all cells
+  starts six fits (one baseline plus one per local measurement), each with up
+  to five next-item epochs. `feature_groups` selects the prior four cumulative
+  variants; `estimated_duration` selects two duration-policy variants.
+  Preference epochs are zero for this first feature comparison. No optimization
+  starts merely by opening the notebook.
+  `COMPARISON_VARIANTS` is the editable mapping of names to `FeatureConfig`
+  objects. The settings cell includes examples for add-one and leave-one-out
+  experiments. `FEATURE_CONFIG` controls only single-model runs.
+  Learning rates and patience now reach comparison training as well.
 - `RUN_FINAL_TEST=False` until configuration selection is complete. Final test
   output is a separate file. Do not tune on those results and continue claiming
   an untouched test set.
 
 Training writes only new files in ignored `sensitive_info/model_runs/<run>/`.
+Successful comparisons save `comparison_results.json` in a new comparison run
+folder: configurations, epoch histories, metrics, parameter costs, seeds,
+input file signatures and candidate protocol. The notebook prints a compact
+results table too. Comparison model weights are not saved; train the chosen
+configuration separately to obtain an inference checkpoint.
 Checkpoints contain artist vocabularies and trained personal weights; keep them
 private. They package schema/config, fitted preprocessing, architecture, weights,
 and run metadata together. `load_checkpoint` uses restricted tensor/data loading
@@ -114,7 +140,36 @@ Tests use synthetic catalogs, history, audio and temporary outputs:
 python -m pytest tests/test_model_features.py tests/test_model_data.py tests/test_model_network.py tests/test_model_training.py tests/test_model_workflow.py -q
 ```
 
-The starting checkout has an unrelated full-suite collection error:
-`tests/test_feature_extraction.py` imports `core.feature_extraction` but the
-tracked package is `scripts`. This work deliberately leaves that conflicting
-acquisition-side test unchanged.
+The prior `core.feature_extraction` test import mismatch was resolved by the
+merged acquisition branch. The merged baseline suite passed 372 tests before
+the notebook-control and duration-policy changes described above.
+
+## Notebook experiment controls
+
+The notebook's Control reference section lists every supported feature flag,
+encoding option, sampling/data setting, optimizer setting and model dimension.
+Original audio columns are always included. Each local measurement has its own
+boolean switch: `local_rms_db`, `local_onset_strength`,
+`local_spectral_centroid`, `local_spectral_contrast`, `local_beat_regularity`.
+Disabling one removes that value, availability mask and its own provenance/scope
+inputs. The older `local=False` master gate remains compatible and overrides all
+five; leave it True to use individual switches. Selected descriptors remain
+separate inputs, never an averaged or composite acoustic value.
+
+Per-column original-audio ablations, date-window filters, source cohorts, custom
+session gaps and notebook split-fraction controls are not implemented. Do not
+alter the master CSV to simulate those experiments.
+
+`individual_local_variants()` builds the baseline plus five add-one cases with
+provenance disabled by default, isolating numerical measurements.
+`estimated_duration_variants()` keeps the other configuration choices fixed and
+varies estimate inclusion; results explicitly record the potential held-out
+history dependence. `INCLUDE_ESTIMATED_DURATIONS` applies to single-model runs
+and all variants in the other two comparison modes. Duration-comparison mode
+deliberately uses both policies regardless of that global switch.
+
+Keep the candidate universe, seed, context length and validation limits fixed
+within feature comparisons. Default variants are cumulative; use an add-one
+variant to isolate one feature or a leave-one-out variant to assess its value
+alongside the remaining features. Different configurations can retain different
+training examples, which is why the result table includes training coverage.
