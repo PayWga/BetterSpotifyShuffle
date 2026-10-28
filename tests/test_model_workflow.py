@@ -48,7 +48,7 @@ def test_comparison_shares_validation_cases_and_leaves_test_untouched():
               'metadata':FeatureConfig(local=False,provenance=False)}
     result=m.run_comparison(catalog,history,variants=variants,model_config=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0),
                             epochs=1,preference_epochs=0,num_negatives=1,max_examples=2,seed=8,
-                            learning_rate=0.002,preference_learning_rate=0.0002,patience=2)
+                            learning_rate=0.002,preference_learning_rate=0.0002,patience=2,cooldown_seconds=0)
     assert len(result)==2
     assert result[0]['evaluation_fingerprint']==result[1]['evaluation_fingerprint']
     assert all(r['test_evaluated'] is False for r in result)
@@ -138,3 +138,30 @@ def test_estimated_duration_variants_make_policy_choice_explicit():
     assert variants['without_estimated_durations'].include_estimated_durations is False
     assert variants['with_estimated_durations'].include_estimated_durations is True
     assert all(config.duration for config in variants.values())
+
+
+def test_comparison_pauses_only_between_completed_model_fits(monkeypatch):
+    m=comparison_api();events=[]
+    monkeypatch.setattr(m,'sleep',lambda seconds:events.append(('pause',seconds)),raising=False)
+    catalog=pd.DataFrame([dict(id=t,tempo=100+i*20,artists=t) for i,t in enumerate('abcd')])
+    history=pd.DataFrame([dict(track_id=t,event_type='NEUTRAL' if t=='d' else 'PLAY',
+                              timestamp=f'2020-01-{day:02d}T00:0{i}:00Z')
+                          for day in range(1,11) for i,t in enumerate('abcd')])
+    config=FeatureConfig(local=False,provenance=False)
+    m.run_comparison(catalog,history,variants={'first':config,'second':config},
+        model_config=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0),epochs=1,
+        preference_epochs=0,num_negatives=1,max_examples=1,logger=lambda r:events.append(('log',r)))
+    pauses=[i for i,event in enumerate(events) if event[0]=='pause']
+    assert len(pauses)==1 and events[pauses[0]]==('pause',10)
+    completed_first=next(i for i,event in enumerate(events) if event[0]=='log' and
+                          event[1].get('variant')=='first' and event[1].get('epoch')==1)
+    started_second=next(i for i,event in enumerate(events) if event[0]=='log' and
+                          event[1].get('variant')=='second' and 'parameters' in event[1])
+    assert completed_first<pauses[0]<started_second
+
+
+@pytest.mark.parametrize('seconds',[-1,float('nan'),float('inf')])
+def test_comparison_rejects_invalid_cooldown_before_loading_data(seconds):
+    m=comparison_api()
+    with pytest.raises(ValueError,match='cooldown'):
+        m.run_comparison(None,None,cooldown_seconds=seconds)

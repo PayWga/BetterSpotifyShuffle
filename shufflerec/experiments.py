@@ -3,7 +3,8 @@ from dataclasses import asdict, replace
 import gc
 import hashlib
 import json
-from time import perf_counter
+import math
+from time import perf_counter, sleep
 
 from .data import prepare_data
 from .features import FeatureConfig, LOCAL
@@ -42,7 +43,10 @@ def _key(example):
 def run_comparison(catalog, history, *, variants=None, model_config=None, max_length=10,
                    epochs=5, preference_epochs=3, batch_size=32, num_negatives=99,
                    max_examples=500, seed=42, device='cpu', logger=None,
-                   learning_rate=1e-3, preference_learning_rate=1e-4, patience=3):
+                   learning_rate=1e-3, preference_learning_rate=1e-4, patience=3,
+                   cooldown_seconds=10):
+    if not math.isfinite(cooldown_seconds) or cooldown_seconds < 0:
+        raise ValueError('cooldown_seconds must be finite and nonnegative')
     variants = default_variants() if variants is None else variants
     if not variants:
         raise ValueError('Provide at least one feature configuration')
@@ -70,7 +74,7 @@ def run_comparison(catalog, history, *, variants=None, model_config=None, max_le
     training_options = dict(epochs=epochs, preference_epochs=preference_epochs, batch_size=batch_size,
                             learning_rate=learning_rate, preference_learning_rate=preference_learning_rate,
                             patience=patience)
-    for name, config in variants.items():
+    for index, (name, config) in enumerate(variants.items()):
         started = perf_counter()
         prepared = prepare_data(catalog, history, config, max_length)
         seed_everything(seed)
@@ -88,7 +92,12 @@ def run_comparison(catalog, history, *, variants=None, model_config=None, max_le
                         'uses_history_derived_duration_estimates': bool(config.duration and config.include_estimated_durations),
                         'duration_estimate_note': ('Estimates may incorporate held-out listening events; '
                             'this comparison is not a strictly chronological estimate experiment.'
-                            if config.duration and config.include_estimated_durations else None)})
+                            if config.duration and config.include_estimated_durations else None),
+                        'configured_cooldown_seconds': cooldown_seconds})
         del model, prepared
         gc.collect()
+        if index < len(variants) - 1 and cooldown_seconds:
+            if logger:
+                logger({'event': 'model_cooldown', 'completed_variant': name, 'seconds': cooldown_seconds})
+            sleep(cooldown_seconds)
     return results

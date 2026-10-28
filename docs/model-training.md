@@ -106,6 +106,10 @@ different devices/backends are not promised.
   objects. The settings cell includes examples for add-one and leave-one-out
   experiments. `FEATURE_CONFIG` controls only single-model runs.
   Learning rates and patience now reach comparison training as well.
+  `MODEL_COOLDOWN_SECONDS=10` adds an idle pause after releasing each model
+  except the last, before starting preparation for the next fit. Set 0 to
+  disable. The setting is recorded in reports; model elapsed times exclude
+  the idle interval. This does not monitor or guarantee hardware temperature.
 - `RUN_FINAL_TEST=False` until configuration selection is complete. Final test
   output is a separate file. Do not tune on those results and continue claiming
   an untouched test set.
