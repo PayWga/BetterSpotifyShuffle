@@ -58,7 +58,9 @@ def test_comparison_shares_validation_cases_and_leaves_test_untouched():
     assert all(r['history'][0]['phase']=='next_item' for r in result)
 
 
-def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(tmp_path,monkeypatch):
+@pytest.mark.parametrize('training_variant,expected_local',[
+    ('compact_encoding',()),('add_local_rms_db',('local_rms_db',))])
+def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(tmp_path,monkeypatch,training_variant,expected_local):
     from pathlib import Path
     notebook=json.loads(Path('notebooks/ShuffleRec.ipynb').read_text(encoding='utf-8'))
     assert any('RUN_TRAINING' in ''.join(c.get('source',[])) for c in notebook['cells']), 'notebook is not integrated'
@@ -76,15 +78,21 @@ def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(t
         if cell['cell_type']!='code':continue
         source=''.join(cell['source'])
         exec(compile(source,'ShuffleRec.ipynb','exec'),ns)
-        if 'RUN_TRAINING = False' in source:
+        if 'TRAINING_OPTIONS = dict(' in source:
             ns['RUN_TRAINING']=True
             ns['RUN_COMPARISON']=False
+            ns['TRAINING_VARIANT']=training_variant
             ns['TRAINING_OPTIONS'].update(epochs=1,preference_epochs=0,batch_size=16)
             ns['MODEL_CONFIG']=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0)
             ns['NUM_NEGATIVES']=1
     assert ns['training_result']['test_evaluated'] is False
+    assert ns['data'].preprocessor.config.enabled_local_features==expected_local
+    assert ns['data'].preprocessor.config.provenance is False
+    assert ns['data'].preprocessor.config.key_encoding=='circular'
     assert (master.read_bytes(),hist.read_bytes())==before
     assert list((project/'sensitive_info/model_runs').glob('*/model.pt'))
+    summary=next((project/'sensitive_info/model_runs').glob('*/training_summary.json'))
+    assert json.loads(summary.read_text(encoding='utf-8'))['training_variant']==training_variant
 
 
 def test_notebook_comparison_uses_custom_variants_options_and_saves_results(tmp_path,monkeypatch):
@@ -104,7 +112,7 @@ def test_notebook_comparison_uses_custom_variants_options_and_saves_results(tmp_
     for cell in nb['cells']:
         if cell['cell_type']!='code':continue
         source=''.join(cell['source']);exec(compile(source,'notebook-comparison','exec'),ns)
-        if 'RUN_TRAINING = False' in source:
+        if 'TRAINING_OPTIONS = dict(' in source:
             ns.update(RUN_TRAINING=False,RUN_COMPARISON=True,RUN_AUDIT=False,NUM_NEGATIVES=1,MAX_EVAL_EXAMPLES=2)
             ns['TRAINING_OPTIONS'].update(epochs=1,preference_epochs=0,batch_size=16,learning_rate=0.002,patience=2)
             ns['MODEL_CONFIG']=ModelConfig(d_model=8,nhead=2,feedforward=16,dropout=0)

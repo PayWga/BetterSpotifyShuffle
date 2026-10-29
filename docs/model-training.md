@@ -90,13 +90,18 @@ different devices/backends are not promised.
 ## Run controls and artifacts
 
 - `RUN_AUDIT=False` currently skips repeating the read-only aggregate scan.
-- `RUN_TRAINING=False` skips the separate single-model experiment. Enable it to
-  train using `FEATURE_CONFIG`; it does not select comparison variants.
-- `RUN_COMPARISON=True` currently configures the notebook to run audio, metadata,
+- `RUN_TRAINING=True` currently selects one fresh training run. Set
+  `TRAINING_VARIANT="compact_encoding"` (the current preset), `metadata`,
+  `audio_baseline`, `extended_acoustics`, or an individual-local variant name.
+  Use `TRAINING_VARIANT="custom"` to use `FEATURE_CONFIG` directly. Resolved
+  flags are printed and the selected name is saved in the run summary.
+  `MODEL_CONFIG` controls architecture, not feature selection. A new checkpoint
+  is trained and saved; no existing comparison checkpoint path is required.
+- `RUN_COMPARISON=False` currently skips comparisons. Enable separately to run audio, metadata,
   compact encoding, and local-acoustic variants. All share common validation
   contexts/targets/candidates, and each reports its training coverage. Models
   are built sequentially to avoid storing several catalog-sized tensors.
-  `COMPARISON_MODE="individual_local"` is now the default: running all cells
+  `COMPARISON_MODE="individual_local"` remains the comparison preset: when enabled, running all cells
   starts six fits (one baseline plus one per local measurement), each with up
   to five next-item epochs. `feature_groups` selects the prior four cumulative
   variants; `estimated_duration` selects two duration-policy variants.
@@ -104,7 +109,8 @@ different devices/backends are not promised.
   starts merely by opening the notebook.
   `COMPARISON_VARIANTS` is the editable mapping of names to `FeatureConfig`
   objects. The settings cell includes examples for add-one and leave-one-out
-  experiments. `FEATURE_CONFIG` controls only single-model runs.
+  experiments. `FEATURE_CONFIG` controls custom single-model runs; named presets
+  are selected using `TRAINING_VARIANT` and resolved before preparation.
   Learning rates and patience now reach comparison training as well.
   `MODEL_COOLDOWN_SECONDS=10` adds an idle pause after releasing each model
   except the last, before starting preparation for the next fit. Set 0 to
