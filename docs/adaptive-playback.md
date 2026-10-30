@@ -3,9 +3,9 @@
 The shared tracker accepts normalized observations from a playback backend. The
 existing polling daemon now uses it with one Spotify playback read per iteration.
 No model scoring, artist metadata lookup, or queue lookup adds API reads to that
-iteration. Windows media-session observation and SOCKS setup remain separate
-backend/connection work; the current implementation uses the Web API for PC and
-phone observation.
+iteration. Windows media-session observation remains separate backend work; the
+current implementation uses the Web API for PC and phone observation, with
+optional private SOCKS routing.
 
 ## Polling and credentials
 
@@ -15,11 +15,50 @@ Inspect options without authentication or network calls:
 python scripts/polling.py --help
 ```
 
-Once the connection is configured, the existing entry point runs the observer:
+The existing entry point runs the observer:
 
 ```powershell
 python scripts/polling.py --early-poll 15 --max-gap 75 --skip-threshold 0.25
 ```
+
+Install Spotify transport dependencies with
+`python -m pip install -r requirements-spotify.txt`. PySocks supplies SOCKS5
+support for Requests. Existing model/data dependencies remain unchanged.
+
+Routing settings live in the ignored private file
+`sensitive_info/spotify_proxy.json`, alongside the Spotify credentials. Its
+`enabled` boolean is the default switch for playback, metadata and library
+clients. This is the shape of a config using synthetic placeholders:
+
+```json
+{
+  "enabled": true,
+  "type": "SOCKS5",
+  "address": "127.0.0.1",
+  "port": 1080,
+  "username": "YOUR_PROXY_USERNAME",
+  "password": "YOUR_PROXY_PASSWORD"
+}
+```
+
+Set `enabled` to `false` for direct connections, or override the file for one
+polling run:
+
+```powershell
+python scripts/polling.py --proxy
+python scripts/polling.py --no-proxy
+```
+
+Restart clients after editing the file: routing is loaded once per session.
+`--proxy` requires valid configuration; `--no-proxy` skips proxy-file loading.
+Missing optional configuration defaults to direct connections. Malformed enabled
+configuration or unavailable SOCKS support fails closed. SOCKS5 uses remote DNS
+(`socks5h`) and safely encoded authentication. Both API calls and OAuth token
+requests share routing; browser navigation during interactive login follows the
+browser's own settings. Environment HTTP/HTTPS proxy variables are ignored so
+the private switch controls routing deterministically. Connection failures emit
+a sanitized error and do not fall back to direct traffic. These settings affect
+Spotify sessions, not audio acquisition or other applications.
 
 The gateway reads `sensitive_info/spotify_credentials.json` and reuses
 `sensitive_info/.spotify_cache`. Credentials are neither embedded in source nor

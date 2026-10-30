@@ -46,11 +46,12 @@ CSV_COLUMNS = [
 ]
 
 
-def get_spotify_client():
+def get_spotify_client(*, use_proxy=None):
     """Use the shared budgeted transport and existing private OAuth files."""
     from scripts.spotify_gateway import create_client
     return create_client(credentials_path=CREDS_PATH, cache_path=CACHE_PATH,
-                         budget_path=PRIVATE_DIR / 'spotify_request_budget.json', scope=SCOPE)
+                         budget_path=PRIVATE_DIR / 'spotify_request_budget.json', scope=SCOPE,
+                         use_proxy=use_proxy)
 
 
 def init_csv():
@@ -140,7 +141,7 @@ def log_track(track_data, listened_ms, context_uri, context_type, reason_end):
     )
 
 
-def start_daemon(config=None):
+def start_daemon(config=None, *, use_proxy=None):
     from shufflerec.playback import PlaybackConfig, PlaybackTracker
     from scripts.playback_daemon import run_polling, write_evidence
     from scripts.spotify_budget import SpotifyBudgetBlocked
@@ -148,7 +149,7 @@ def start_daemon(config=None):
     config = config or PlaybackConfig()
     init_csv()
     try:
-        client = get_spotify_client()
+        client = get_spotify_client(use_proxy=use_proxy)
     except SpotifyBudgetBlocked:
         print('Playback observation blocked by the shared Spotify cooldown.')
         return
@@ -164,6 +165,10 @@ def main(argv=None):
     parser.add_argument('--max-gap', type=float, default=75.)
     parser.add_argument('--idle-poll', type=float, default=30.)
     parser.add_argument('--skip-threshold', type=float, default=.25)
+    routing = parser.add_mutually_exclusive_group()
+    routing.add_argument('--proxy', dest='use_proxy', action='store_true', help='Force private SOCKS routing')
+    routing.add_argument('--no-proxy', dest='use_proxy', action='store_false', help='Connect directly')
+    parser.set_defaults(use_proxy=None)
     args = parser.parse_args(argv)
     try:
         config = PlaybackConfig(acceptance_threshold=args.skip_threshold,
@@ -171,7 +176,7 @@ def main(argv=None):
                                 max_gap_seconds=args.max_gap, idle_poll_seconds=args.idle_poll)
     except ValueError as exc:
         parser.error(str(exc))
-    start_daemon(config)
+    start_daemon(config, use_proxy=args.use_proxy)
 
 
 if __name__ == '__main__':

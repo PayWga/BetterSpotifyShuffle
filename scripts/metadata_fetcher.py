@@ -33,21 +33,31 @@ class MetadataTracker:
             self.authenticate()
 
 
-    def authenticate(self):
-            """Wakes up the Spotify connection only when needed."""
-            try:
-                with open(self.creds_path, 'r') as f:
-                    creds = json.load(f)
-            except FileNotFoundError:
-                raise FileNotFoundError(f"\nCRITICAL: Cannot find file at:\n{self.creds_path}\n")
-                
+    def authenticate(self, *, use_proxy=None):
+        """Read private credentials and reuse budgeted API/OAuth routing."""
+        try:
+            from .spotify_metadata import metadata_session
+            from .spotify_budget import SpotifyRequestBudget
+        except ImportError:
+            from spotify_metadata import metadata_session
+            from spotify_budget import SpotifyRequestBudget
+        budget = SpotifyRequestBudget(self.creds_path.parent / 'spotify_request_budget.json')
+        budget.check_allowed()
+        try:
+            with self.creds_path.open(encoding='utf-8') as stream:
+                creds = json.load(stream)
+            values = {key: creds[key] for key in ('client_id', 'client_secret', 'redirect_uri')}
+        except (OSError, ValueError, TypeError, KeyError):
+            raise ValueError('Could not load Spotify credentials from the configured private file') from None
+        session = metadata_session(budget, use_proxy=use_proxy)
+        try:
             self.sp = spotipy.Spotify(auth_manager=SpotifyOAuth(
-                client_id=creds["client_id"],
-                client_secret=creds["client_secret"],
-                redirect_uri=creds["redirect_uri"],
-                scope="user-library-read user-read-playback-state",
-                cache_handler=CacheFileHandler(cache_path=self.cache_path)
-            ))
+                **values, scope='user-library-read user-read-playback-state',
+                cache_handler=CacheFileHandler(cache_path=str(self.cache_path)), requests_session=session),
+                requests_session=session, retries=0, status_retries=0, requests_timeout=20)
+        except Exception:
+            session.close()
+            raise
 
 
     def _load_memory(self):

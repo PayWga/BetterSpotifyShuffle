@@ -344,17 +344,19 @@ def get_metadata_guard():
     )
 
 
-def get_spotify_client():
+def get_spotify_client(*, use_proxy=None):
     """Use the same private credentials/cache as the project's playback tools."""
     budget = get_metadata_guard()
     budget.check_allowed()
     with (PRIVATE_DIR / 'spotify_credentials.json').open(encoding='utf-8') as source:
         creds = json.load(source)
+    session = spotify_metadata.metadata_session(budget, use_proxy=use_proxy)
     return spotipy.Spotify(auth_manager=SpotifyOAuth(
         client_id=creds['client_id'], client_secret=creds['client_secret'],
         redirect_uri=creds['redirect_uri'], scope=SCOPE,
         cache_handler=CacheFileHandler(cache_path=str(PRIVATE_DIR / '.spotify_cache')),
-    ), requests_session=spotify_metadata.metadata_session(budget),
+        requests_session=session,
+    ), requests_session=session,
         retries=0, status_retries=0, requests_timeout=30)
 
 

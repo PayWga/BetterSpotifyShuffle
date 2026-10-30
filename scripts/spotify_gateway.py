@@ -1,7 +1,7 @@
 """Credential-backed Spotify transport sharing the existing persistent budget.
 
-No authentication or network activity occurs on import. SOCKS configuration is
-deliberately left to the later connection setup.
+No authentication or network activity occurs on import. Private SOCKS settings
+are loaded when the budgeted session is constructed.
 """
 import json
 from pathlib import Path
@@ -22,7 +22,7 @@ SCOPE = 'user-read-playback-state user-read-currently-playing'
 
 
 def create_client(*, credentials_path=CREDS_PATH, cache_path=CACHE_PATH,
-                  budget_path=BUDGET_PATH, scope=SCOPE):
+                  budget_path=BUDGET_PATH, scope=SCOPE, use_proxy=None, proxy_config_path=None):
     budget = SpotifyRequestBudget(budget_path)
     budget.check_allowed()
     try:
@@ -32,7 +32,7 @@ def create_client(*, credentials_path=CREDS_PATH, cache_path=CACHE_PATH,
             raise ValueError('Invalid credential fields')
     except (OSError, ValueError, TypeError, KeyError) as exc:
         raise ValueError('Could not load Spotify credentials from the configured private file') from None
-    session = metadata_session(budget)
+    session = metadata_session(budget, use_proxy=use_proxy, proxy_config_path=proxy_config_path)
     try:
         auth = SpotifyOAuth(**values, scope=scope, cache_handler=CacheFileHandler(cache_path=str(cache_path)),
                             requests_session=session, requests_timeout=20)

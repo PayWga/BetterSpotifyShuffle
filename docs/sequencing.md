@@ -127,8 +127,9 @@ Small playlists may require reducing `recent_window` to permit further playback.
 
 Adaptive weights, recent history and the queue are session-local. Restarting resets
 them. Adaptive playback observations and submitted-selection feedback are described
-in [the playback guide](adaptive-playback.md); Spotify playback commands, SOCKS
-setup, and automatic playlist loading remain future integration work. Captured output
+in [the playback guide](adaptive-playback.md), including private SOCKS routing.
+Spotify playback commands and automatic playlist loading remain future
+integration work. Captured output
 contains personal track IDs and selection history, so keep it out of commits.
 
 Tests use synthetic checkpoints/catalogs and temporary files only:
