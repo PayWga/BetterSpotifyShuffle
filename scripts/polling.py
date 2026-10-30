@@ -54,13 +54,14 @@ def get_spotify_client(*, use_proxy=None):
                          use_proxy=use_proxy)
 
 
-def init_csv():
+def init_csv(*, csv_path=None):
     """Initialize the unified listening history CSV."""
 
-    CSV_FILE.parent.mkdir(parents=True, exist_ok=True)
+    path = Path(csv_path) if csv_path is not None else CSV_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
 
-    if CSV_FILE.exists():
-        with open(CSV_FILE, "r", encoding="utf-8") as f:
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
             existing_header = next(csv.reader(f), [])
 
         if existing_header != CSV_COLUMNS:
@@ -71,7 +72,7 @@ def init_csv():
 
         return
 
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+    with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writeheader()
 
@@ -92,7 +93,7 @@ def classify_live_event(completion_rate, reason_end):
     return "NEUTRAL", 0, 0
 
 
-def log_track(track_data, listened_ms, context_uri, context_type, reason_end):
+def log_track(track_data, listened_ms, context_uri, context_type, reason_end, *, csv_path=None, quiet=False):
     from shufflerec.playback import finite
     raw_duration = track_data.get('duration_ms')
     duration_ms = int(raw_duration) if finite(raw_duration) and raw_duration > 0 else None
@@ -129,11 +130,13 @@ def log_track(track_data, listened_ms, context_uri, context_type, reason_end):
         "event_source": "live_polling"
     }
 
-    with open(CSV_FILE, "a", newline="", encoding="utf-8") as f:
+    with open(csv_path if csv_path is not None else CSV_FILE, "a", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
         writer.writerow(record)
 
     completion_text = f'{completion_rate:.1%}' if completion_rate is not None else 'unknown'
+    if quiet:
+        return
     print(
         f"Logged: {track_data['name']} | "
         f"Completion: {completion_text} | "
@@ -145,17 +148,19 @@ def start_daemon(config=None, *, use_proxy=None):
     from shufflerec.playback import PlaybackConfig, PlaybackTracker
     from scripts.playback_daemon import run_polling, write_evidence
     from scripts.spotify_budget import SpotifyBudgetBlocked
+    from scripts.playback_lease import PlaybackLease
 
     config = config or PlaybackConfig()
-    init_csv()
-    try:
-        client = get_spotify_client(use_proxy=use_proxy)
-    except SpotifyBudgetBlocked:
-        print('Playback observation blocked by the shared Spotify cooldown.')
-        return
-    print('Adaptive listening daemon started...')
-    run_polling(client, tracker=PlaybackTracker(config), event_sink=write_evidence,
-                history_sink=log_track)
+    with PlaybackLease(PRIVATE_DIR / 'playback_owner.lock'):
+        init_csv()
+        try:
+            client = get_spotify_client(use_proxy=use_proxy)
+        except SpotifyBudgetBlocked:
+            print('Playback observation blocked by the shared Spotify cooldown.')
+            return
+        print('Adaptive listening daemon started...')
+        run_polling(client, tracker=PlaybackTracker(config), event_sink=write_evidence,
+                    history_sink=log_track)
 
 
 def main(argv=None):

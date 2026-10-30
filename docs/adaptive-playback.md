@@ -5,7 +5,8 @@ existing polling daemon now uses it with one Spotify playback read per iteration
 No model scoring, artist metadata lookup, or queue lookup adds API reads to that
 iteration. Windows media-session observation remains separate backend work; the
 current implementation uses the Web API for PC and phone observation, with
-optional private SOCKS routing.
+optional private SOCKS routing. The [live pipeline](live-pipeline.md) connects this
+tracker to automatic playlist loading, model inference and queue modification.
 
 ## Polling and credentials
 
@@ -116,8 +117,9 @@ Occurrence/selection IDs are local to a process, not globally persistent IDs.
 
 `PlaybackSession` joins a sequencer to a tracker. It freezes a submitted queue
 prefix separately from replannable suggestions. Register a submission only after
-the playback transport acknowledges it; no playback submission is performed by
-this stage. Starts inferred from verified progression commit variety fatigue just
+the playback transport acknowledges it. The live controller performs queue
+submissions and verification; the standalone poller remains read-only. Starts
+inferred from verified progression commit variety fatigue just
 like observed starts. Feedback changes only the supplying pool, once per selection.
 External songs can enter confirmed context on acceptance without pool attribution.
 

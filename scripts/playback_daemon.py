@@ -37,6 +37,38 @@ def snapshot_from_playback(playback, observed_at):
                     (playback.get('context') or {}).get('uri'))
 
 
+class PlaybackRecorder:
+    def __init__(self, *, event_sink=None, history_sink=None, historical_skip_threshold=.15):
+        self.event_sink, self.history_sink = event_sink, history_sink
+        self.historical_skip_threshold = historical_skip_threshold
+        self.metadata = {}
+
+    def consume(self, events, item=None, context=None):
+        for event in events:
+            if event.kind == 'started' and item:
+                self.metadata[event.occurrence_id] = (item, context or {})
+            if self.event_sink is not None:
+                self.event_sink(event)
+            if event.kind == 'ended':
+                record = self.metadata.pop(event.occurrence_id, None)
+                if self.history_sink is not None and record and not event.inferred:
+                    track, source = record
+                    reason = event.reason
+                    duration = track.get('duration_ms')
+                    # A measured lower bound of zero isn't proof of an early
+                    # skip. Preserve legacy classification without mislabelling
+                    # outages, transfers, or uncertain timing as GHOST_SKIP.
+                    if reason == 'track_change' and (not finite(duration) or duration <= 0
+                            or event.listened_ms < duration * self.historical_skip_threshold):
+                        proven_skip = (event.outcome == 'rejected' and not event.weak
+                                       and finite(duration) and duration > 0 and finite(event.upper_bound_ms)
+                                       and event.upper_bound_ms < duration * self.historical_skip_threshold)
+                        if not proven_skip:
+                            reason = 'uncertain_transition'
+                    self.history_sink(track, int(event.listened_ms), source.get('uri'), source.get('type'), reason)
+
+
+
 def run_polling(client, *, tracker=None, clock=time.monotonic, sleeper=time.sleep,
                 event_sink=None, history_sink=None, max_polls=None, historical_skip_threshold=.15,
                 continuity_check=None):
@@ -46,32 +78,11 @@ def run_polling(client, *, tracker=None, clock=time.monotonic, sleeper=time.slee
     queue, so only an integrated PlaybackSession may assert queue continuity.
     """
     tracker = tracker or PlaybackTracker()
-    metadata = {}
     polls = 0
 
-    def dispatch(events, item=None, context=None):
-        for event in events:
-            if event.kind == 'started' and item:
-                metadata[event.occurrence_id] = (item, context or {})
-            if event_sink is not None:
-                event_sink(event)
-            if event.kind == 'ended':
-                record = metadata.pop(event.occurrence_id, None)
-                if history_sink is not None and record and not event.inferred:
-                    track, source = record
-                    reason = event.reason
-                    duration = track.get('duration_ms')
-                    # A measured lower bound of zero isn't proof of an early
-                    # skip. Preserve legacy classification without mislabelling
-                    # outages, transfers, or uncertain timing as GHOST_SKIP.
-                    if reason == 'track_change' and (not finite(duration) or duration <= 0
-                            or event.listened_ms < duration * historical_skip_threshold):
-                        proven_skip = (event.outcome == 'rejected' and not event.weak
-                                       and finite(duration) and duration > 0 and finite(event.upper_bound_ms)
-                                       and event.upper_bound_ms < duration * historical_skip_threshold)
-                        if not proven_skip:
-                            reason = 'uncertain_transition'
-                    history_sink(track, int(event.listened_ms), source.get('uri'), source.get('type'), reason)
+    recorder = PlaybackRecorder(event_sink=event_sink, history_sink=history_sink,
+                                historical_skip_threshold=historical_skip_threshold)
+    dispatch = recorder.consume
 
     try:
         while max_polls is None or polls < max_polls:

@@ -105,7 +105,7 @@ class PlaybackTracker:
         self._inactive_since = None
         self._consumed = set()
 
-    def set_submitted(self, tracks, *, version):
+    def set_submitted(self, tracks, *, version, follows_active=False):
         tracks = tuple(tracks)
         if not isinstance(version, str) or not version or any(not isinstance(t, SubmittedTrack) for t in tracks):
             raise ValueError('Submitted order requires a nonempty version and SubmittedTrack entries')
@@ -117,6 +117,8 @@ class PlaybackTracker:
         self._index = None
         if self.active and self.active.selection_id is not None:
             self._index = next((i for i, t in enumerate(tracks) if t.selection_id == self.active.selection_id), None)
+        elif self.active and follows_active:
+            self._index = -1  # verified first upcoming item follows external active playback
 
     def interrupt(self):
         """An outage is not a pause, listen, skip, or proof of queue continuity."""
@@ -203,7 +205,7 @@ class PlaybackTracker:
                     events.append(self._event(item, 'ended', outcome, weight, inferred=True,
                                               weak=weak, gap=gap, upper=gap, reason='queue_progression'))
                     self._consumed.add(submitted.selection_id)
-            elif not replay and not (safe and continuity and self._order_valid and next_index is not None):
+            elif not replay and not (continuity and self._order_valid and next_index is not None):
                 # Identifying the next acknowledged item does not require an
                 # acknowledged predecessor (e.g. initial external playback).
                 self._order_valid = False

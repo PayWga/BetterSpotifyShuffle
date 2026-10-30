@@ -48,20 +48,30 @@ class Sequencer:
         self._resolved_submissions = set()
         self._submission_feedback = set()
 
-    def plan(self, *, provisional_ids=()):
+    def plan(self, *, provisional_ids=(), provisional_pools=(), exclude=(), relax_recent=False):
         if self.active is not None:
             raise ValueError('Resolve the active selection before replanning')
         queue, diagnostics = [], []
         context = self.context_ids + list(provisional_ids)
         fatigue = self.fatigue.copy()
-        excluded = set(self.recent)
+        for pool in provisional_pools:
+            fatigue = self.policy.advance(fatigue, pool)
+        hard_excluded = set(exclude)
+        excluded = set(self.recent) | hard_excluded
         excluded.update(item.track_id for identity, item in self._submitted.items()
                         if identity not in self._resolved_submissions)
+        hard_excluded.update(item.track_id for identity, item in self._submitted.items()
+                             if identity not in self._resolved_submissions)
         anchor = context[-1] if context else None
         if anchor:
             excluded.add(anchor)
+            hard_excluded.add(anchor)
         for _ in range(self.config.queue_size):
             eligible = [track for track in self.playlist_ids if track not in excluded]
+            if not eligible and relax_recent:
+                eligible = [track for track in self.playlist_ids if track not in hard_excluded]
+                if eligible and 'recent_window_relaxed' not in diagnostics:
+                    diagnostics.append('recent_window_relaxed')
             if not eligible:
                 diagnostics.append('playlist_exhausted')
                 break
@@ -85,6 +95,7 @@ class Sequencer:
             context.append(track)
             anchor = track
             excluded.add(track)
+            hard_excluded.add(track)
             fatigue = self.policy.advance(fatigue, pool)
         self.queue = queue
         self.diagnostics = diagnostics
@@ -134,6 +145,15 @@ class Sequencer:
 
     def has_selection_feedback(self, selection_id):
         return selection_id in self._submission_feedback
+
+    def abandon_selection(self, selection_id):
+        """Release uncertain ownership without inventing a listen or feedback."""
+        if selection_id not in self._submitted:
+            raise ValueError('Unknown submitted selection')
+        self._submitted.pop(selection_id)
+        self._started_submissions.discard(selection_id)
+        self._resolved_submissions.add(selection_id)
+        self._submission_feedback.add(selection_id)
 
     def start_next(self):
         if self._submitted and self._submitted.keys() - self._resolved_submissions:

@@ -4,12 +4,11 @@ The offline sequencer uses a selected model checkpoint to produce a rolling
 five-song queue. It makes no Spotify requests and never writes its inputs.
 Install the existing `requirements-model.txt`; no new dependencies are required.
 
-The playlist CSV is only an input adapter for offline testing. The sequencer
-itself accepts an in-memory collection of track IDs, so the future Spotify/proxy
-integration will not require creating or maintaining `playlist.csv`. That adapter
-will first resolve the current playback playlist, fetch its complete track list,
-then pass those IDs to inference and sequencing. Playlist changes/edits will need
-an explicit refresh; that integration is deferred until playback is connected.
+The playlist CSV is only an input adapter for offline testing. The
+[live pipeline](live-pipeline.md) loads the current Spotify playlist automatically
+and passes its IDs directly to inference and sequencing. It follows playlist
+changes and checks playlist snapshot versions for edits; no playlist CSV is
+needed for live playback.
 
 For offline testing now, from the repository root start a persistent session:
 
@@ -128,8 +127,8 @@ Small playlists may require reducing `recent_window` to permit further playback.
 Adaptive weights, recent history and the queue are session-local. Restarting resets
 them. Adaptive playback observations and submitted-selection feedback are described
 in [the playback guide](adaptive-playback.md), including private SOCKS routing.
-Spotify playback commands and automatic playlist loading remain future
-integration work. Captured output
+Spotify queue additions and automatic playlist loading are connected through the
+[live entry point](live-pipeline.md). Captured output
 contains personal track IDs and selection history, so keep it out of commits.
 
 Tests use synthetic checkpoints/catalogs and temporary files only:

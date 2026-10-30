@@ -156,3 +156,40 @@ def test_one_polling_loop_feeds_coordinator_and_recovers_submitted_skips():
     assert sum(seq.policy.preferences) == pytest.approx(-.30)
     assert session.tracker.active is None
     assert session.submitted == []
+
+
+def test_verified_prefix_can_anchor_skips_after_an_external_current_track():
+    m = api()
+    seq = Sequencer(Engine(), [str(i) for i in range(20)], context_ids=['0'])
+    seq.plan()
+    session = m.PlaybackSession(seq, auto_replan=False)
+    session.observe(observation('external', 0))
+    submitted = session.submit_prefix(3)
+    session.confirm_order(follows_active=True)
+    events = session.observe(observation(submitted[2].track_id, 15), continuity=True)
+    inferred = [e for e in events if e.inferred]
+    assert [e.selection_id for e in inferred] == [submitted[0].selection_id, submitted[1].selection_id]
+    assert all(e.weight == 1. for e in inferred)
+
+
+def test_abandonment_releases_unheard_submissions_without_penalties():
+    seq, session, submitted = setup_session()
+    before = seq.policy.preferences.copy()
+    session.abandon([item.selection_id for item in submitted])
+    assert session.submitted == []
+    assert seq.policy.preferences == before
+    assert seq.fatigue == [0., 0., 0.]
+    seq.plan()
+    assert not seq._submitted
+
+
+def test_planning_snapshot_anchors_after_committed_tail_without_mutating_session():
+    seq, session, submitted = setup_session()
+    session.observe(observation('external', 0))
+    before = seq.policy.preferences.copy(), seq.fatigue.copy(), seq.context_ids.copy()
+    clone, ids, pools = session.planning_snapshot(exclude=['19'])
+    clone.plan(provisional_ids=ids, provisional_pools=pools, exclude=['19'])
+    assert ids == ['external'] + [item.track_id for item in submitted]
+    assert pools == [item.pool for item in submitted]
+    assert '19' not in {item.track_id for item in clone.queue}
+    assert (seq.policy.preferences, seq.fatigue, seq.context_ids) == before
