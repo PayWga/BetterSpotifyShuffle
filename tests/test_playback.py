@@ -24,7 +24,7 @@ def test_acceptance_changes_schedule_without_finishing_or_rewarding_twice():
     assert tracker.active.track_id == 'a'
     assert tracker.next_delay() == 75
     assert tracker.observe(snap(m, 'a', 120, 120000)) == []
-    assert tracker.next_delay() == 58  # observe just before the predicted ending
+    assert tracker.next_delay() == 58  # Check just before the predicted ending.
     tracker.observe(snap(m, 'a', 179, 179000))
     assert tracker.next_delay() == 1
     ended = tracker.observe(snap(m, 'b', 180, 0))

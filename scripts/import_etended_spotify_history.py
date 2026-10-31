@@ -2,9 +2,16 @@
 import os
 import json
 import glob
+import math
 from pathlib import Path
+from typing import NamedTuple
 
 import pandas as pd
+
+if __package__:
+    from .history_schema import REQUIRED_COLUMNS
+else:
+    from history_schema import REQUIRED_COLUMNS
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
@@ -20,59 +27,65 @@ LIVE_LOGGED_CSV = PRIVATE_DIR / "spotify_listening_history.csv"
 
 UNZIPPED_SPOTIFY_FOLDER = PRIVATE_DIR / "history"
 
-DEFAULT_DURATION_MS = 210000
-
 SKIP_THRESHOLD = 0.15
 PLAY_THRESHOLD = 0.70
 
-EVENT_COLUMNS = [
-    "timestamp",
-    "track_id",
-    "track_name",
-    "artist_name",
-    "ms_played",
-    "duration_ms",
-    "completion_rate",
-    "reason_start",
-    "reason_end",
-    "event_type",
-    "is_play",
-    "is_ghost_skip",
-    "context_uri",
-    "context_type",
-    "event_source"
-]
+EVENT_COLUMNS = list(REQUIRED_COLUMNS)
 
 
+class DurationEvidence(NamedTuple):
+    duration_ms: float
+    duration_ms_is_estimated: bool | None
+    duration_ms_source: str | None
 
-def build_duration_lookup(history_files, master_db_path):
+
+UNKNOWN_DURATION = DurationEvidence(float('nan'), None, None)
+
+
+def estimate_status(value):
+    """Read known estimate flags without treating an absent flag as confirmation."""
+    return {'true': True, '1': True, '1.0': True,
+            'false': False, '0': False, '0.0': False}.get(str(value).strip().casefold())
+
+
+def duration_is_estimated(flag, *sources):
+    return estimate_status(flag) is True or any(
+        str(source).strip().casefold() == 'history_completed_play_median' for source in sources)
+
+
+def build_duration_lookup(history_files, master_db_path, *, include_provenance=False):
     """Build a track duration lookup from the master database and history."""
 
     duration_lookup = {}
 
     if os.path.exists(master_db_path):
-        db_df = pd.read_csv(
-            master_db_path,
-            usecols=["id", "duration_ms"],
-            low_memory=False
-        )
-
-        db_df["id"] = db_df["id"].astype("string")
+        fields = {'id', 'duration_ms', 'duration_ms_is_estimated',
+                  'duration_ms_source', 'duration_ms_metadata_source'}
+        db_df = pd.read_csv(master_db_path, usecols=lambda name: name in fields,
+                            dtype='string', keep_default_na=False, low_memory=False)
+        if not {'id', 'duration_ms'}.issubset(db_df):
+            raise ValueError('Master duration lookup requires id and duration_ms')
+        db_df["id"] = db_df["id"].str.strip()
         db_df["duration_ms"] = pd.to_numeric(
             db_df["duration_ms"],
             errors="coerce"
         )
 
         db_df = db_df.dropna(subset=["id", "duration_ms"])
-        db_df = db_df[db_df["duration_ms"] > 0]
+        db_df = db_df[(db_df["duration_ms"] > 0) & db_df['duration_ms'].map(math.isfinite)
+                        & db_df['id'].ne('')]
         db_df = db_df.drop_duplicates(subset=["id"])
 
-        duration_lookup = dict(
-            zip(db_df["id"], db_df["duration_ms"])
-        )
+        for row in db_df.itertuples(index=False):
+            source = (getattr(row, 'duration_ms_source', '')
+                      or getattr(row, 'duration_ms_metadata_source', '') or 'master_catalog')
+            estimated = estimate_status(getattr(row, 'duration_ms_is_estimated', None))
+            if estimated is None and source == 'history_completed_play_median':
+                estimated = True
+            duration_lookup[row.id] = DurationEvidence(row.duration_ms, estimated, source)
 
-    # Use completed listening events as an approximate
-    # duration source only for tracks missing from the DB.
+    # Estimate duration from completed plays only when the catalog has no value.
+    # These estimates are approximate, not independently confirmed durations.
     estimated_durations = {}
 
     for filepath in history_files:
@@ -82,30 +95,32 @@ def build_duration_lookup(history_files, master_db_path):
         for item in data:
             uri = item.get("spotify_track_uri")
 
-            if not uri or not uri.startswith("spotify:track:"):
+            if not isinstance(uri, str) or not uri.startswith("spotify:track:"):
                 continue
 
-            track_id = uri.split(":")[-1]
+            track_id = uri.split(":")[-1].strip()
+            if not track_id:
+                continue
 
             if track_id in duration_lookup:
                 continue
 
-            ms_played = item.get("ms_played") or 0
+            ms_played = pd.to_numeric(item.get("ms_played"), errors='coerce')
 
             if (
                 item.get("reason_end") == "trackdone"
-                and ms_played > 0
+                and pd.notna(ms_played) and math.isfinite(ms_played) and ms_played > 0
             ):
                 estimated_durations.setdefault(
                     track_id, []
                 ).append(ms_played)
 
     for track_id, durations in estimated_durations.items():
-        duration_lookup[track_id] = float(
-            pd.Series(durations).median()
-        )
+        duration_lookup[track_id] = DurationEvidence(float(pd.Series(durations).median()),
+            True, 'history_completed_play_median')
 
-    return duration_lookup
+    return duration_lookup if include_provenance else {
+        track: record.duration_ms for track, record in duration_lookup.items()}
 
 
 def classify_listening_event(
@@ -115,7 +130,13 @@ def classify_listening_event(
 ):
     """Classify an event using completion and playback information."""
 
-    if reason_end == "trackdone" or completion_rate >= PLAY_THRESHOLD:
+    if reason_end == "trackdone":
+        return "PLAY", 1, 0
+
+    if pd.isna(completion_rate) or not math.isfinite(completion_rate):
+        return "NEUTRAL", 0, 0
+
+    if completion_rate >= PLAY_THRESHOLD:
         return "PLAY", 1, 0
 
     confirmed_skip = (
@@ -148,7 +169,8 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
 
     duration_lookup = build_duration_lookup(
         history_files,
-        master_db_path
+        master_db_path,
+        include_provenance=True,
     )
 
     parsed_records = []
@@ -160,10 +182,12 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
         for row in data:
             uri = row.get("spotify_track_uri")
 
-            if not uri or not uri.startswith("spotify:track:"):
+            if not isinstance(uri, str) or not uri.startswith("spotify:track:"):
                 continue
 
-            track_id = uri.split(":")[-1]
+            track_id = uri.split(":")[-1].strip()
+            if not track_id:
+                continue
 
             timestamp = row.get("ts")
             if not timestamp:
@@ -173,15 +197,10 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
                 0, int(row.get("ms_played") or 0)
             )
 
-            duration_ms = duration_lookup.get(
-                track_id,
-                DEFAULT_DURATION_MS
-            )
+            evidence = duration_lookup.get(track_id, UNKNOWN_DURATION)
+            duration_ms = evidence.duration_ms
 
-            completion_rate = min(
-                ms_played / max(duration_ms, 1),
-                1.0
-            )
+            completion_rate = min(ms_played / duration_ms, 1.) if pd.notna(duration_ms) else float('nan')
 
             reason_end = row.get("reason_end") or ""
             reason_start = row.get("reason_start") or ""
@@ -189,7 +208,8 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
 
             event_type, is_play, is_ghost_skip = (
                 classify_listening_event(
-                    completion_rate,
+                    float('nan') if duration_is_estimated(evidence.duration_ms_is_estimated,
+                        evidence.duration_ms_source) else completion_rate,
                     reason_end,
                     skipped
                 )
@@ -209,6 +229,8 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
 
                 "ms_played": ms_played,
                 "duration_ms": duration_ms,
+                "duration_ms_is_estimated": evidence.duration_ms_is_estimated,
+                "duration_ms_source": evidence.duration_ms_source,
                 "completion_rate": round(completion_rate, 4),
 
                 "reason_start": reason_start,
@@ -223,7 +245,7 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
 
                 "event_source": "extended_history",
 
-                # Preserve useful Spotify history fields
+                # Keep extra Spotify fields available for later experiments.
                 "shuffle": row.get("shuffle"),
                 "skipped": skipped,
                 "offline": row.get("offline"),
@@ -250,7 +272,7 @@ def process_extended_streaming_history(history_folder, master_db_path, output_cs
         kind="stable"
     ).reset_index(drop=True)
 
-    # Preserve timezone information in an explicit ISO format.
+    # Write an explicit UTC timestamp so timezone information survives CSV storage.
     df["timestamp"] = df["timestamp"].dt.strftime(
         "%Y-%m-%dT%H:%M:%S.%fZ"
     )
@@ -272,6 +294,11 @@ def normalize_listening_history(df, source):
     """Normalize historical and live listening records."""
 
     df = df.copy()
+
+    if 'track_id' not in df:
+        raise ValueError("Listening data must contain 'track_id'.")
+    df['track_id'] = df['track_id'].astype('string').str.strip()
+    df = df[df['track_id'].notna() & df['track_id'].ne('')].copy()
 
     # Rename columns from the original polling format.
     df = df.rename(columns={
@@ -312,7 +339,7 @@ def normalize_listening_history(df, source):
         / df.loc[can_calculate, "duration_ms"]
     ).clip(0, 1)
 
-    # Preserve original event source when already present.
+    # Keep an existing event source; fill it only when missing.
     if "event_source" not in df.columns:
         df["event_source"] = source
     else:
@@ -331,24 +358,27 @@ def normalize_listening_history(df, source):
             df[col] = None
 
     # Classify records that do not already have labels.
-    missing_labels = df["event_type"].isna()
+    missing_labels = df["event_type"].isna() | df['event_type'].astype('string').str.strip().eq('')
 
     for idx in df.index[missing_labels]:
         completion = df.at[idx, "completion_rate"]
 
-        if pd.isna(completion):
-            continue
-
         reason_end = df.at[idx, "reason_end"]
+        reason_end = '' if pd.isna(reason_end) else str(reason_end)
         skipped = (
             df.at[idx, "skipped"]
             if "skipped" in df.columns
             else False
         )
+        skipped = str(skipped).strip().casefold() in ('true', '1', '1.0')
+        estimated = df.at[idx, 'duration_ms_is_estimated'] if 'duration_ms_is_estimated' in df else None
+        sources = (df.at[idx, name] for name in ('duration_ms_source', 'duration_ms_metadata_source') if name in df)
+        if duration_is_estimated(estimated, *sources):
+            completion = float('nan')
 
-        # Live polling may not have explicit skip reasons.
-        # An early ending is only an inferred negative signal.
-        if source == "live_polling" and pd.isna(reason_end):
+        # Older live logs may lack a skip reason.
+        # An early ending provides inferred feedback, not a confirmed dislike.
+        if source == "live_polling" and not reason_end and pd.notna(completion):
             if completion >= PLAY_THRESHOLD:
                 labels = ("PLAY", 1, 0)
             elif completion < SKIP_THRESHOLD:
@@ -362,9 +392,8 @@ def normalize_listening_history(df, source):
                 skipped
             )
 
-        df.at[idx, "event_type"] = labels[0]
-        df.at[idx, "is_play"] = labels[1]
-        df.at[idx, "is_ghost_skip"] = labels[2]
+        for name, value in zip(('event_type', 'is_play', 'is_ghost_skip'), labels):
+            df.at[idx, name] = str(value) if isinstance(df[name].dtype, pd.StringDtype) else value
 
     return df
 
@@ -399,13 +428,14 @@ def normalize_timestamps(df, legacy_timezone=None):
         # as timezone-naive UTC timestamps.
         return ts.tz_localize("UTC")
 
-    df["timestamp"] = [
+    timestamps = [
         parse_timestamp(value, source)
         for value, source in zip(
             df["timestamp"],
             df["event_source"]
         )
     ]
+    df['timestamp'] = pd.Series(timestamps, index=df.index, dtype='datetime64[ns, UTC]')
 
     return df.dropna(subset=["timestamp"])
 
@@ -415,8 +445,9 @@ def combine_and_deduplicate(extended_csv, logged_csv, output_csv, legacy_timezon
 
     print("Loading historical listening datasets...")
 
-    df_ext = pd.read_csv(extended_csv, low_memory=False)
-    df_log = pd.read_csv(logged_csv, low_memory=False)
+    options = dict(dtype='string', keep_default_na=False, na_values=[''], low_memory=False)
+    df_ext = pd.read_csv(extended_csv, **options)
+    df_log = pd.read_csv(logged_csv, **options)
 
     df_ext = normalize_listening_history(
         df_ext,
@@ -464,8 +495,8 @@ def combine_and_deduplicate(extended_csv, logged_csv, output_csv, legacy_timezon
         keep="first"
     )
 
-    # Identify cross-source overlaps conservatively.
-    # Compare live events against the imported historical events.
+    # Check live events against imported history for nearby duplicates.
+    # Keep events without a matching track and timestamp within the tolerance.
     extended = df_combined[
         df_combined["event_source"] == "extended_history"
     ].sort_values("timestamp")
@@ -506,17 +537,6 @@ def combine_and_deduplicate(extended_csv, logged_csv, output_csv, legacy_timezon
             other["_row_id"].isin(unmatched_ids)
         ].drop(columns=["_row_id"])
 
-    for frame in (df_ext, df_log):
-        if "track_id" not in frame.columns:
-            raise ValueError("Listening data must contain 'track_id'.")
-
-        frame.dropna(subset=["track_id"], inplace=True)
-        frame["track_id"] = frame["track_id"].astype(str).str.strip()
-        frame.drop(
-            frame.index[frame["track_id"] == ""],
-            inplace=True
-        )
-
     df_clean = pd.concat(
         [extended, other],
         ignore_index=True
@@ -528,6 +548,8 @@ def combine_and_deduplicate(extended_csv, logged_csv, output_csv, legacy_timezon
     ).reset_index(drop=True)
 
     df_clean = df_clean.drop(columns=["_priority"])
+    df_clean = df_clean.reindex(columns=EVENT_COLUMNS + [
+        name for name in df_clean.columns if name not in EVENT_COLUMNS])
 
     df_clean["timestamp"] = (
         df_clean["timestamp"]
@@ -593,8 +615,7 @@ def rebuild_preference_counts(history_csv, memory_file):
     if not isinstance(memory, dict):
         raise ValueError("Invalid daemon memory format.")
 
-    # Counts come from the unified listening history.
-    # Existing per-track metadata is preserved.
+    # Rebuild counts from unified history while keeping other per-track metadata.
     for record in memory.values():
         record["play_count"] = 0
         record["skip_count"] = 0
@@ -653,8 +674,8 @@ if __name__ == "__main__":
             logged_csv=LIVE_LOGGED_CSV,
             output_csv=LIVE_LOGGED_CSV,
 
-            # Set this to the original polling machine's
-            # timezone for legacy timezone-naive live logs.
+            # Legacy live logs without an offset need the original polling
+            # machine's timezone here.
             legacy_timezone=None
         )
 

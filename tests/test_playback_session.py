@@ -55,7 +55,7 @@ def test_acceptance_is_rewarded_once_while_song_remains_active():
     assert sum(before) == pytest.approx(.15)
     assert seq.context_ids[-1] == a.track_id
     session.observe(observation(b.track_id, 75), continuity=True)
-    assert seq.policy.preferences == before  # accepted A cannot be rejected again
+    assert seq.policy.preferences == before  # Track A was already accepted and cannot receive another penalty.
 
 
 def test_inferred_weak_rejection_gets_half_penalty_and_full_skip_gets_full_penalty():

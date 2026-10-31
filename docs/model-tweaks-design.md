@@ -1,5 +1,9 @@
 # Model feature and evaluation changes
 
+Historical design record from 2026-10-19. Branch references and execution notes
+below describe that implementation; current usage is documented in
+[model-training.md](model-training.md).
+
 Approved direction: conversation on 2026-10-19. Implement on model_tweaks,
 targeting the enriched extracting_features catalog without modifying that
 branch's acquisition, metadata, datasets, tests, README, or .gitignore.

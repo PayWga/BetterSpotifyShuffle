@@ -252,7 +252,7 @@ def test_duplicate_exports_and_conflicting_event_copies_do_not_inflate_evidence(
     # Equivalent timezone notation is the same event, not another observation.
     equivalent = dict(a[0], ts='2024-01-01T00:00:00+00:00')
     write_audio_history(tmp_path, a + [equivalent, conflicting] + invalid_timestamps, 'two')
-    # No timestamp means no deduplicatable evidence.
+    # A timestamp is needed to deduplicate the listening evidence.
     write_audio_history(tmp_path, [dict(e, ts=None) for e in completed_plays(A, [180000] * 5)], 'three')
     dm.backfill_local_metadata(path, source_root=tmp_path)
     saved = rows(path)

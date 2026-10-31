@@ -46,7 +46,7 @@ def test_artist_alias_collaboration_unknown_and_genre_namespaces():
     batch=p.transform(catalog())
     assert set(batch['artist'][0]) - {0} == {p.vocabularies['artist']['id:id-a'],p.vocabularies['artist']['id:id-b']}
     assert batch['artist'][2,0] == p.vocabularies['artist']['id:id-a']
-    assert batch['artist'][3,0] == 1  # unknown, distinct from padding
+    assert batch['artist'][3,0] == 1  # Unknown category ID stays separate from padding.
     assert batch['genre'][2,0] == 1
     assert batch['artist_genre'][0,0] >= 2
     assert 'folk' not in p.vocabularies['genre']

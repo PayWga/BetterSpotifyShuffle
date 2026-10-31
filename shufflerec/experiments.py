@@ -52,7 +52,8 @@ def run_comparison(catalog, history, *, variants=None, model_config=None, max_le
         raise ValueError('Provide at least one feature configuration')
     common_examples, common_candidates = None, None
     first_examples = None
-    # Sequential passes avoid retaining several catalog-sized tensor stores.
+    # Prepare variants one at a time so several full tensor stores
+    # do not need to stay in memory together.
     for config in variants.values():
         prepared = prepare_data(catalog, history, config, max_length)
         examples = prepared.examples['validation']['nip']

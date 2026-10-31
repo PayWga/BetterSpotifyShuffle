@@ -34,8 +34,8 @@ venv/
 sensitive_info
 docs/superpowers
 
-# Local cross-branch development handoff (also covered by sensitive_info above)
-/sensitive_info/BRANCH_HANDOFF.md
+
+/docs/project-review-2026-10-31.md
 
 # Reproducible test artifacts and downloaded audio
 .pytest_cache/

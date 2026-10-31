@@ -72,8 +72,8 @@ class BudgetedAdapter(requests.adapters.HTTPAdapter):
                 raise
             failed = True
         if failed:
-            # Raise outside the except block: neither exception text nor an
-            # attached original traceback may retain authenticated proxy URLs.
+            # Raise outside the handler so the original exception and traceback
+            # cannot expose proxy URLs containing credentials.
             try:
                 from .spotify_proxy import SpotifyProxyError
             except ImportError:
@@ -82,22 +82,22 @@ class BudgetedAdapter(requests.adapters.HTTPAdapter):
         if response.status_code == 429 and self.budget is not None:
             delay = retry_delay(response.headers)
             seconds = 86400 if delay is None else delay + 60
-            # The status/headers are enough to enforce a pause. Persist before
-            # reading an optional body, which can itself fail on the network.
+            # Save the cooldown from the headers first. Reading the response body
+            # can fail even after the rate limit has been received.
             self.budget.pause(seconds, 'Spotify 429')
             try:
                 supplied_reason = response.json().get('error', {}).get('reason')
             except (ValueError, AttributeError, TypeError, RequestException):
                 supplied_reason = None
-            # Only log bounded plain reason codes; never arbitrary response text.
+            # Log only short, plain reason codes; response text may contain private details.
             if supplied_reason is None:
                 reason = 'unspecified'
             elif isinstance(supplied_reason, str) and re.fullmatch(r'[A-Za-z0-9_ -]{1,80}', supplied_reason):
                 reason = supplied_reason
             else:
                 reason = 'unrecognized'
-            # Missing reset information fails conservatively for 24 hours.
-            # A known reset gets a minute of margin, never a shorter wait.
+            # Use a 24-hour pause when the reset time is unknown.
+            # Known reset times get an extra minute of margin.
             response.close()
             if reason == 'QUOTA_EXCEEDED':
                 self.budget.pause(seconds, 'QUOTA_EXCEEDED')
@@ -216,7 +216,7 @@ def backfill_backlog(backlog_path, client_factory, save, *, sp=None, dry_run=Fal
                 stats['unavailable'] += 1
                 put(index, 'spotify_metadata_error', 'unavailable', replace=True)
                 continue
-            if track['id'] != tid and (track.get('linked_from') or {}).get('id') != tid:
+            if not track_identity_matches(track, tid):
                 stats['failed'] += 1
                 put(index, 'spotify_metadata_error', 'recording_identity_mismatch', replace=True)
                 continue
@@ -311,8 +311,8 @@ def request(call):
         except SpotifyException as exc:
             if exc.http_status == 429:
                 delay = retry_delay(exc.headers)
-                # Even a short 429 may represent quota exhaustion. Stop rather
-                # than spending more requests testing the restriction.
+                # Even a short 429 can mean the quota is exhausted.
+                # Stop the job instead of probing with more requests.
                 raise SpotifyCooldown(delay) from exc
             elif attempt == 3 or exc.http_status < 500:
                 raise
@@ -328,12 +328,22 @@ def request(call):
         time.sleep(max(0, delay))
 
 
+def track_identity_matches(track, requested_id):
+    """Accept the requested recording or an explicit relink from that ID."""
+    linked = track.get('linked_from')
+    return (track.get('id') == requested_id
+            or isinstance(linked, dict) and linked.get('id') == requested_id)
+
+
 def fetch_track(sp, track_id, extra_metadata=False, cache=None):
     track = request(lambda: sp.track(track_id))
     if not track or not track.get('id'):
         return {}
-    # Spotify may return a relinked recording. The caller retains the requested
-    # catalog ID; never rename IDs or attach metadata by response order.
+    if not track_identity_matches(track, track_id):
+        raise SpotifyException(http_status=502, code=-1,
+                               msg='Spotify returned metadata for an unrelated recording')
+    # Spotify can return a relinked recording. Keep the requested catalog ID
+    # when attaching the returned metadata.
     result = track_metadata(track)
     if not extra_metadata:
         return result
@@ -409,7 +419,7 @@ def fill_records(df, records, fields, allow_new=False):
 def apply_checkpoint(master_path, checkpoint, save, dry_run=False):
     master_path, checkpoint = Path(master_path), Path(checkpoint)
     state = load_checkpoint(checkpoint, master_path)
-    # Reload here: extraction may have added measurements since the fetch began.
+    # Reload the catalog because extraction may have added measurements during the fetch.
     df = read_catalog(master_path)
     counts = fill_records(df, state['records'], state['fields'])
     if counts and not dry_run:
@@ -567,8 +577,8 @@ def backfill(master_path, checkpoint, client_factory, save, *, sp=None, fields=N
                         if tid not in state['retry']:
                             state['retry'].append(tid)
                         print(f'Request failed (HTTP {getattr(exc, "http_status", "network")}); rerun to retry.')
-                    # Preserve useful local aliases even if Spotify failed, but
-                    # leave transient failures eligible for the next run.
+                    # Keep useful local aliases even when the request fails.
+                    # Temporary failures stay eligible for the next run.
                     if record:
                         state['records'][tid] = record
                     dirty = True

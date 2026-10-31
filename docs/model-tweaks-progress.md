@@ -1,5 +1,9 @@
 # Model tweaks progress — docs/model-tweaks-design.md
 
+Historical progress record for the original model changes. Counts, branch
+references, and execution notes below describe that development snapshot.
+Current usage is documented in [model-training.md](model-training.md).
+
 - Approved in-chat plan and user instruction are the implementation brief.
 - Existing local .gitignore edit must remain untouched.
 - No commits, merges, network jobs, or real dataset writes are planned.

@@ -33,7 +33,7 @@ class Client:
 
 def test_playlist_pages_handle_new_legacy_and_unavailable_items_without_overwriting_cache():
     m = api(); client = Client()
-    # Override fixture's episode type without mutating other track records.
+    # Set the episode type on a copy so other fixture records stay unchanged.
     original = client.playlist_items
     def pages(*args, **kwargs):
         page = original(*args, **kwargs)
@@ -51,7 +51,7 @@ def test_playlist_pages_handle_new_legacy_and_unavailable_items_without_overwrit
     assert cache.load('playlist', now=100) is first
     assert len(client.calls) == calls
     assert cache.load('playlist', now=301) is first
-    assert len(client.calls) == calls + 1  # snapshot unchanged: no item pages
+    assert len(client.calls) == calls + 1  # An unchanged snapshot needs no item-page requests.
 
 
 def test_empty_or_unavailable_playlist_is_not_a_successful_candidate_source():

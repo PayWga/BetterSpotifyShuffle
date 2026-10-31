@@ -4,14 +4,12 @@ Open `notebooks/ShuffleRec.ipynb` from the project root or `notebooks/`.
 Install `requirements-model.txt` in the same Python environment as the notebook
 kernel. Acquisition dependencies remain in their existing requirements file.
 
-## Data contract and branch integration
+## Data contract
 
-This implementation consumes the enriched master table produced by
-`extracting_features`; it does not import that branch's acquisition modules.
-No acquisition file, existing test, source CSV, private history, README, or
-.gitignore is edited by the model workflow. Merge the data/acquisition branch
-normally when ready; no model code or column list should need changing for its
-documented fields. Unknown optional columns produce missing inputs.
+The workflow consumes the enriched master table produced by the project's
+ingestion and acoustic extraction scripts. Model loading does not import audio
+acquisition modules, and unknown optional columns produce missing inputs. Source
+catalog and history files are read-only during preparation and training.
 
 The model uses original audio properties plus artist, represented release year,
 confirmed duration, track genre, separate artist genres, and local acoustics.
@@ -121,6 +119,10 @@ different devices/backends are not promised.
   an untouched test set.
 
 Training writes only new files in ignored `sensitive_info/model_runs/<run>/`.
+Input signatures are captured before preparation and verified after both files
+have loaded. A change during preparation stops the run. Training summaries keep
+those loaded-input signatures and separately report whether source files changed
+later, so background polling cannot make a summary describe the wrong snapshot.
 Successful comparisons save `comparison_results.json` in a new comparison run
 folder: configurations, epoch histories, metrics, parameter costs, seeds,
 input file signatures and candidate protocol. The notebook prints a compact
@@ -150,9 +152,9 @@ Tests use synthetic catalogs, history, audio and temporary outputs:
 python -m pytest tests/test_model_features.py tests/test_model_data.py tests/test_model_network.py tests/test_model_training.py tests/test_model_workflow.py -q
 ```
 
-The prior `core.feature_extraction` test import mismatch was resolved by the
-merged acquisition branch. The merged baseline suite passed 372 tests before
-the notebook-control and duration-policy changes described above.
+Tests cover synthetic preprocessing, training, checkpoint round trips, and
+notebook orchestration. Historical test totals in design/progress notes describe
+their original development snapshots, not the current suite.
 
 ## Notebook experiment controls
 

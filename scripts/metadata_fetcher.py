@@ -120,19 +120,7 @@ class MetadataTracker:
     def get_days_since_added(self, track_id):
         """Return library age in days, or None if unknown."""
 
-        metadata = self.get_metadata(track_id)
-        added_at = metadata.get("added_at")
-
-        if not added_at:
-            return None
-
-        added_date = datetime.fromisoformat(
-            added_at.replace("Z", "+00:00")
-        )
-
-        now = datetime.now(timezone.utc)
-
-        return max(0, (now - added_date).days)
+        return self.get_metadata(track_id)["days_since_added"]
 
 
     def register_play(self, track_id):
@@ -200,8 +188,8 @@ class MetadataTracker:
 
             results = self.sp.next(results)
 
-        # Records absent from Liked Songs shouldn't retain
-        # an outdated current-library addition timestamp.
+        # Clear the addition date for tracks no longer in Liked Songs.
+        # An old date would give them an incorrect current library age.
         for track_id, metadata in self.memory.items():
             if track_id not in saved_ids:
                 metadata["added_at"] = None
@@ -245,6 +233,6 @@ class MetadataTracker:
         return max(0, (now - added_date).days)
 
 
-#tracker = MetadataTracker()
-
-#tracker.sync_library_dates()
+# Optional library sync:
+# tracker = MetadataTracker()
+# tracker.sync_library_dates()

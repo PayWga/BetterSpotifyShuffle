@@ -14,13 +14,18 @@ from .features import FeaturePreprocessor
 from .model import ModelConfig, SpotifySASRec
 
 
+EVALUATION_CACHE_TRACKS = 8192
+EVALUATION_BATCH_SIZE = 1024
+
+
 def seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    # Seeded runs are reproducible on the same backend; GPU kernels can differ.
+    # Seeds keep runs repeatable on the same backend.
+    # Different GPU kernels can still produce different results.
     if torch.backends.cudnn.is_available():
         torch.backends.cudnn.benchmark = False
         torch.backends.cudnn.deterministic = True
@@ -66,7 +71,7 @@ def build_evaluation_plan(examples, candidate_ids, *, num_negatives=99, max_exam
         if not negatives:
             raise ValueError('Evaluation has no eligible negative tracks')
         candidates = negatives + [sample.positive]
-        rng.shuffle(candidates)  # ties must not systematically favor the target
+        rng.shuffle(candidates)  # Shuffle ties so the target has no fixed position advantage.
         cases.append(EvaluationCase(sample.context, sample.positive, tuple(candidates), sample.timestamp.isoformat()))
     return EvaluationPlan(tuple(cases), seed, num_negatives, scope)
 
@@ -83,15 +88,32 @@ def evaluate(model, store, plan, *, k=10):
             for case in plan.cases:
                 if len(set(case.candidates)) != len(case.candidates) or case.positive not in case.candidates:
                     raise ValueError('Candidates must be unique and contain the target')
+            candidate_ids = sorted({track for case in plan.cases for track in case.candidates})
+            vectors = None
+            # Cache a bounded candidate snapshot for this evaluation pass only.
+            # Custom rankers keep their scoring contract, and later epochs start fresh.
+            if (type(model) is SpotifySASRec
+                    and getattr(model.score_candidates, '__func__', None) is SpotifySASRec.score_candidates
+                    and len(candidate_ids) <= EVALUATION_CACHE_TRACKS):
+                chunks = [model.track_encoder(to_device(store.take(candidate_ids[start:start + EVALUATION_BATCH_SIZE]), device))
+                          for start in range(0, len(candidate_ids), EVALUATION_BATCH_SIZE)]
+                vectors = torch.cat(chunks)
+                candidate_index = {track: i for i, track in enumerate(candidate_ids)}
+            for case in plan.cases:
                 context, padding = store.context(case.context, model.max_length)
                 context = to_device({name: value.unsqueeze(0) for name, value in context.items()}, device)
                 state = model(context, padding.unsqueeze(0).to(device))
-                scores = model.score_candidates(state, to_device(store.take(case.candidates), device))[0]
+                if vectors is None:
+                    scores = model.score_candidates(state, to_device(store.take(case.candidates), device))[0]
+                else:
+                    indexes = torch.tensor([candidate_index[track] for track in case.candidates], device=device)
+                    scores = (state @ vectors.index_select(0, indexes).T)[0]
                 if not torch.isfinite(scores).all():
                     raise FloatingPointError('Non-finite evaluation scores')
                 target_index = case.candidates.index(case.positive)
                 target_score = scores[target_index]
-                # Fixed shuffled candidate order breaks ties reproducibly and fairly.
+                # Break score ties using the fixed shuffled order.
+                # This keeps evaluation repeatable without favoring the target.
                 earlier = torch.arange(len(scores), device=device) < target_index
                 rank = 1 + int(((scores > target_score) | ((scores == target_score) & earlier)).sum())
                 hit = rank <= k
@@ -163,8 +185,8 @@ def fit(model, prepared, validation_plan, *, epochs=5, preference_epochs=3, batc
                 stale += 1
             if stale >= patience:
                 break
-        # Preference optimization starts from the selected next-item model;
-        # a preference phase that degrades validation is discarded.
+        # Start preference training from the best next-item weights.
+        # Keep those weights if preference training does not improve validation.
         if best_weights is not None:
             model.load_state_dict(best_weights)
     if best_weights is None:
@@ -178,13 +200,13 @@ def save_checkpoint(path, model, preprocessor, *, metadata=None):
                'model_config': asdict(model.config), 'max_length': model.max_length,
                'weights': {name: value.detach().cpu() for name, value in model.state_dict().items()},
                'metadata': metadata or {}}
-    # Exclusive creation prevents replacing a previous experiment silently.
+    # Create a new file so an existing experiment cannot be overwritten.
     with Path(path).open('xb') as stream:
         torch.save(payload, stream)
 
 
 def load_checkpoint(path, *, device='cpu'):
-    # Accept only the plain data/tensors written by this module, not pickled code.
+    # Load only data and tensors; checkpoint loading must not execute pickled code.
     payload = torch.load(path, map_location='cpu', weights_only=True)
     if payload.get('version') != 1:
         raise ValueError('Unsupported model checkpoint version')

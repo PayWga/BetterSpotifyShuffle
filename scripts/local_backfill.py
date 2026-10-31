@@ -65,7 +65,7 @@ def fill_aliases(df, counts, origin='master'):
     if 'release_date' not in df:
         return
     dates = df['release_date'].str.strip()
-    # Validate complete dates/months before interpreting their detail or year.
+    # Check that dates and months are valid before deriving a year or precision.
     unique = {}
     for text in dates.dropna().unique():
         if not re.fullmatch(r'\d{4}(?:-\d{2})?(?:-\d{2})?', text):
@@ -130,7 +130,8 @@ class Candidates:
         self.values = {}
         self.conflicts = {}
         self.fields = FIELDS | (MATCHING_FIELDS if allow_matching else set())
-        # Only retain events for duration gaps, not the million-track catalog.
+        # Keep completed-play evidence only for tracks with missing durations.
+        # Retaining it for the full catalog would waste memory.
         self.duration_gaps = set(df.index[missing_mask(df, 'duration_ms')])
         self.completed_plays = {}
 
@@ -154,7 +155,7 @@ class Candidates:
         if event not in events:
             events[event] = duration
         elif events[event] != duration:
-            # Conflicting copies remain excluded even if later copies agree.
+            # Once copies disagree, exclude that event even if another copy agrees later.
             events[event] = None
 
     def apply_duration_estimates(self, counts):
@@ -164,7 +165,7 @@ class Candidates:
         for tid, events in self.completed_plays.items():
             if tid not in remaining:
                 continue
-            # Do not sidestep disagreement between confirmed local sources.
+            # Conflicting confirmed durations stay unresolved; estimates cannot replace them.
             if tid in self.values.get('duration_ms', {}) and self.values['duration_ms'][tid] is None:
                 continue
             values = [value for value in events.values() if value is not None]
@@ -179,8 +180,8 @@ class Candidates:
             supports[tid] = str(support)
         if estimates:
             put(self.df, 'duration_ms', pd.Series(estimates), ESTIMATE_SOURCE, counts)
-            # Evidence belongs to this newly filled duration. Orphaned flags or
-            # counts from a previous, now-missing duration must not describe it.
+            # These flags and counts describe the newly filled duration.
+            # Replace leftover evidence from an earlier value that is now missing.
             put(self.df, 'duration_ms_is_estimated',
                 pd.Series('True', index=list(estimates)), ESTIMATE_SOURCE, counts,
                 refresh_evidence=True)
@@ -243,7 +244,7 @@ def history_csv(path, candidates):
                 candidates.add(tid, field, row.get(field), source)
             verified = confirmed_duration(row)
             duration_field = 'duration_ms' if verified else 'history_duration_candidate_ms'
-            # Imported fractions/durations are not independent full-play evidence.
+            # Imported durations and completion fractions do not independently prove a full play.
             candidates.add(tid, duration_field, row.get('duration_ms'), source)
 
 
@@ -304,7 +305,8 @@ def master_csv(path, candidates):
                              usecols=lambda col: col in columns):
         if 'id' not in chunk:
             raise ValueError('Master source needs id')
-        # The master can dwarf the backlog; inspect only IDs relevant to this job.
+        # Filter to relevant IDs before processing rows; the master can be much larger
+        # than the backlog being filled.
         chunk = chunk[chunk['id'].str.strip().isin(candidates.df.index)]
         for row in chunk.to_dict('records'):
             tid = str(row['id']).strip()
@@ -360,7 +362,7 @@ def run(master_path, source_root, save, dry_run=False, *, target='master', inclu
     print(f"{'DRY RUN: would estimate' if dry_run else 'Estimated'} {estimated} missing durations "
           f'from repeated completed plays (at least {MIN_COMPLETED_PLAYS} supporting events; '
           '80% within 0.1% of median).', flush=True)
-    # External metadata can complete aliases or supply a release_date.
+    # New metadata may fill an alias or release date. Derive any remaining local fields.
     if target == 'master':
         fill_aliases(df, counts)
     else:

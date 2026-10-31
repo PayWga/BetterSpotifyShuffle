@@ -73,9 +73,9 @@ def load_youtube_cookies(cookie_file: Path | None, browser: str | None):
                                            "supported browsers: " + ", ".join(sorted(SUPPORTED_BROWSERS)))
         specification = (name, profile) if profile else (name,)
     try:
-        # yt-dlp can print raw malformed cookie lines even in quiet mode. Load
-        # before starting workers and suppress those potentially secret values.
-        # No cookiefile parameter on the loader means exiting cannot write back.
+        # Malformed cookie lines can appear even in quiet mode, so suppress stderr
+        # while loading before workers start. The loader has no cookie output
+        # path, keeping the source file unchanged when it closes.
         with redirect_stderr(StringIO()), yt_dlp.YoutubeDL({"quiet": True}) as loader:
             jar = load_cookies(str(cookie_file) if cookie_file is not None else None,
                                specification, loader)
@@ -203,8 +203,8 @@ def title_parts(text: str) -> tuple[str, str]:
 def credit_present(artist: str, credits: str) -> bool:
     if f" {normalized(artist)} " in credits:
         return True
-    # Spotify enrichment and many exports join collaborators with commas. Do
-    # not accept only the first artist: every separated credit must be present.
+    # Spotify metadata and exports often join artists with commas.
+    # Check every separated credit instead of accepting only the first.
     names = [name.strip() for name in re.split(r"[,;]", artist) if name.strip()]
     return len(names) > 1 and all(f" {normalized(name)} " in credits for name in names)
 
@@ -291,15 +291,14 @@ def match_result(item: dict, entry: dict, *, allow_missing_artists: bool = False
     if not core_title or f" {core_title} " not in f" {candidate_core} ":
         return None, "title"
     if requested_remix:
-        # Featured-credit parsing can put a later remix suffix into the credit
-        # text. Require that suffix independently so duration relaxation cannot
-        # substitute a different named remix.
+        # Featured-credit parsing can absorb a trailing remix label.
+        # Check that label separately so a close duration cannot allow the wrong remix.
         labels = re.split(r"[()\[\]]|\s+[-–—]\s+", text_value(item.get("track_name")))
         for label in labels:
             if remix_label(label) and f" {canonical_title(label)} " not in f" {candidate} ":
                 return None, "remix_version"
-        # A matching upload title must not conceal contradictory named-remix
-        # metadata. Bare base-song track names do not themselves contradict it.
+        # A matching title still needs consistent remix metadata.
+        # A plain base-song name alone does not contradict the requested remix.
         for key in ("track", "alt_title", "version", "remixed_by", "remix_artist"):
             value = entry.get(key)
             values = value if isinstance(value, (list, tuple)) else [value]
@@ -333,16 +332,16 @@ def match_result(item: dict, entry: dict, *, allow_missing_artists: bool = False
     primary_present = credit_present(primary_artist, credits)
     if artist_missing and not (primary_present and (allow_missing_artists or close_duration)):
         return None, "artist"
-    # A wider search must not accept a different title merely containing the
-    # requested phrase (e.g. "Another Example Song" for "Example Song").
+    # Broader searches still need the requested song title.
+    # A longer, unrelated title containing the same phrase is not enough.
     if f" {core_title} " not in f" {candidate_core} ":
         return None, "title"
     remaining = f" {candidate_core} ".replace(f" {core_title} ", " ")
     for artist in artists + ([featured] if featured else []):
         for name in [artist] + re.split(r"[,;]", artist):
             remaining = remaining.replace(f" {normalized(name.strip())} ", " ")
-    # Remove complete presentation phrases only after removing the requested
-    # title, so these words in a real song title retain their meaning.
+    # Strip presentation phrases only after matching the requested title.
+    # Words like audio or lyrics can also belong to the actual song name.
     remaining = re.sub(r"\b(?:audio only|full audio)\b", "audio", remaining)
     remaining = re.sub(r"\boriginal mix\b", " ", remaining)
     remaining = re.sub(r"\b(?:lyrics?|letras?|paroles) by\s+.*$", " ", remaining)
@@ -355,7 +354,7 @@ def match_result(item: dict, entry: dict, *, allow_missing_artists: bool = False
         return None, "title"
     versions = {"live", "cover", "acoustic", "karaoke", "instrumental",
                 "slowed", "sped", "nightcore", "demo", "edit", "reverb", "stripped"}
-    # Version terms belonging to the artist's name are not recording labels.
+    # Words in an artist's name do not count as recording-version labels.
     requested = set(normalized(title + " " + " ".join(artists)).split())
     if (words & versions) - requested:
         return None, "version"
@@ -380,7 +379,8 @@ def match_result(item: dict, entry: dict, *, allow_missing_artists: bool = False
     if "topic" in normalized(text_value(entry.get("channel") or entry.get("uploader"))):
         score += .25
     if artist_missing and allow_missing_artists:
-        # Provisional search candidate only: never publish/download on this score.
+        # This score only qualifies the search result for a metadata lookup.
+        # Artist checks still need to pass before downloading.
         return score * .5, "needs_artist_metadata"
     notes = []
     if artist_missing:
@@ -416,7 +416,59 @@ def acquisition_error_code(exc: Exception) -> str:
     return type(exc).__name__
 
 
+def valid_audio_publication(audio: Path) -> bool:
+    """Accept legacy caches, or a committed pair matching its saved signatures."""
+    marker = audio.with_suffix(".publication.json")
+    if not marker.exists():
+        return True
+    try:
+        state = json.loads(marker.read_text(encoding="utf-8"))
+        sidecar = audio.with_suffix(".source.json")
+        return (state.get("version") == 1 and state.get("status") == "committed"
+                and state.get("audio") == audio.name
+                and state.get("audio_signature") == list(file_signature(audio))
+                and state.get("sidecar_signature") == list(file_signature(sidecar)))
+    except (OSError, ValueError, TypeError, AttributeError):
+        return False
+
+
+def publish_audio(audio: Path, sidecar: Path, destination: Path) -> None:
+    """Guard flat-cache replacements with a durable pending/committed marker."""
+    marker = destination.with_suffix(".publication.json")
+    destination_sidecar = destination.with_suffix(".source.json")
+    state = {"version": 1, "status": "pending", "audio": destination.name}
+
+    def save_marker(status):
+        state["status"] = status
+        prepared = audio.parent / f"publication.{status}.json"
+        with prepared.open("x", encoding="utf-8") as stream:
+            json.dump(state, stream)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(prepared, marker)
+
+    # Keep the staged pair intact for recovery, even if either replacement fails.
+    prepared_audio = audio.parent / "publish.wav"
+    prepared_sidecar = audio.parent / "publish.source.json"
+    for source, prepared in ((audio, prepared_audio), (sidecar, prepared_sidecar)):
+        with source.open("rb") as original, prepared.open("xb") as output:
+            shutil.copyfileobj(original, output)
+            output.flush()
+            os.fsync(output.fileno())
+
+    # Readers reject the pair until both replacements and the final marker succeed.
+    # A pending marker survives interruption and never falls back to legacy reuse.
+    save_marker("pending")
+    os.replace(prepared_audio, destination)
+    os.replace(prepared_sidecar, destination_sidecar)
+    state["audio_signature"] = list(file_signature(destination))
+    state["sidecar_signature"] = list(file_signature(destination_sidecar))
+    save_marker("committed")
+
+
 def audio_source(audio: Path) -> str:
+    if not valid_audio_publication(audio):
+        raise RuntimeError("incomplete_audio_publication")
     sidecar = audio.with_suffix(".source.json")
     if sidecar.is_file():
         try:
@@ -474,7 +526,7 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
         rejected_urls.add(identity)
         rejections[reason] += 1
         if len(rejection_examples) < 5:
-            # Do not log signed URLs, arbitrary query parameters or userinfo.
+            # Strip URL credentials and unrelated query parameters before logging a rejection.
             parsed = urlsplit(url)
             query = ""
             if parsed.hostname in ("youtube.com", "www.youtube.com", "m.youtube.com"):
@@ -515,8 +567,8 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
                 continue
             attempted.add(url)
             audio_dir.mkdir(parents=True, exist_ok=True)
-            # Never resume one recording's partial download as another recording.
-            # Retain failed staging files for inspection rather than deleting them.
+            # Isolate each download so partial files cannot carry over between recordings.
+            # Failed staging files stay available for inspection.
             tick = perf_counter()
             conversion_started, converted = None, 0.
 
@@ -561,16 +613,14 @@ def acquire_audio(item: dict, audio_dir: Path, *, cookiejar=None) -> tuple[Path 
                     "match_evidence": reason}, ensure_ascii=False), encoding="utf-8")
                 destination = audio_dir / f"{tid}.wav"
                 destination_sidecar = destination.with_suffix(".source.json")
-                if destination.exists() or destination_sidecar.exists():
+                marker = destination.with_suffix(".publication.json")
+                if destination.exists() or destination_sidecar.exists() or marker.exists():
                     previous = Path(tempfile.mkdtemp(prefix=f".{tid}_previous_", dir=audio_dir))
-                    for existing in (destination, destination_sidecar):
+                    for existing in (destination, destination_sidecar, marker):
                         if existing.exists():
                             shutil.copy2(existing, previous / existing.name)
                     LOG.info("Preserved previous audio/provenance for %s at %s", tid, previous)
-                # Never pair old (possibly remix) audio with new clean provenance
-                # if replacing the audio itself is denied by Windows.
-                os.replace(audio, destination)
-                os.replace(sidecar, destination_sidecar)
+                publish_audio(audio, sidecar, destination)
                 return destination, source
             except Exception as exc:
                 code = acquisition_error_code(exc)
@@ -629,8 +679,8 @@ def atomic_csv(df: pd.DataFrame, path: Path) -> None:
                             path.name, attempt + 1, len(CSV_REPLACE_DELAYS), delay)
                 sleep(delay)
     finally:
-        # A complete snapshot is useful for recovery after failed replacement;
-        # incomplete serialization artifacts must not be mistaken for snapshots.
+        # Keep complete snapshots for recovery when replacement fails.
+        # An unfinished CSV is not a usable recovery snapshot.
         if not prepared and os.path.exists(temp):
             os.unlink(temp)
 
@@ -640,7 +690,7 @@ def find_local_audio(track_id: str, audio_dir: Path) -> Path | None:
         raise ValueError("invalid_track_id")
     for ext in SUPPORTED_EXTENSIONS:
         candidate = audio_dir / f"{track_id}{ext}"
-        if candidate.is_file() and candidate.stat().st_size > 0:
+        if candidate.is_file() and candidate.stat().st_size > 0 and valid_audio_publication(candidate):
             return candidate
     return None
 
@@ -704,8 +754,8 @@ def extract_audio_features(audio_path: Path, seconds: float | None = ANALYSIS_SE
 
     @cache
     def onset_envelope(aggregation):
-        # beat_track(y=...) uses median aggregation; the standalone onset
-        # descriptor uses mean. Share their transform, not their aggregation.
+        # Beat tracking uses median aggregation; the onset descriptor uses mean.
+        # Both can share the mel transform while keeping those calculations separate.
         aggregate = np.median if aggregation == "median" else np.mean
         return librosa.onset.onset_strength(S=log_mel(), sr=sr, aggregate=aggregate)
 
@@ -767,8 +817,8 @@ def read_master(path: Path) -> pd.DataFrame:
     for col in FEATURE_COLUMNS:
         if col in master:
             values = master[col].mask(master[col].str.casefold() == "nan")
-            # Object columns accept new numeric estimates without rewriting
-            # existing feature text or triggering pandas string-dtype errors.
+            # Object columns accept numeric estimates while preserving existing text.
+            # String-only columns would reject those new numeric values.
             master[col] = values.astype(object)
     return master.set_index("id")
 
@@ -801,13 +851,13 @@ def save_batch(results: list[dict], master_path: Path,
         for col in incoming.columns.difference(master.columns):
             master[col] = pd.Series(pd.NA, index=master.index, dtype="string")
         incoming = incoming.reindex(columns=master.columns)
-        # Match schema once on the small incoming frame. This also preserves
-        # extension dtypes when a row lacks optional name/artist metadata.
+        # Match the schema on the smaller incoming frame.
+        # This keeps column types intact when optional metadata is missing.
         for col in master.columns:
             incoming[col] = incoming[col].astype(master[col].dtype)
         master = pd.concat([master, incoming])
-    # Backlog enrichment must survive successful extraction even when the track
-    # already exists in master; fill only gaps and preserve all existing text.
+    # Carry backlog metadata into existing master rows as well as new ones.
+    # Fill only gaps so existing values keep their original text.
     metadata_fields = ('duration_ms', 'isrc', 'spotify_track_name', 'spotify_artist_names',
                        'spotify_resolved_id', 'spotify_metadata_source', 'spotify_metadata_checked_at')
     for record in results:
@@ -822,7 +872,7 @@ def save_batch(results: list[dict], master_path: Path,
             if (pd.isna(previous) or not str(previous).strip()
                     or (col == 'duration_ms' and str(previous).strip().casefold() == 'nan')):
                 master.at[record['track_id'], col] = str(value)
-    # Allocate/cast columns once per checkpoint, not for every track.
+    # Create or cast feature columns once per checkpoint to avoid repeated work per track.
     active = [col for col in FEATURE_COLUMNS if any(pd.notna(row.get(col, np.nan)) for row in results)]
     for col in active:
         if col not in master:
@@ -875,7 +925,7 @@ def prepare_track(item: dict, audio_dir: Path, local_only: bool,
                                         "original file retained", tid)
                             audio = None
                 except (OSError, ValueError, TypeError):
-                    pass  # audio_source reports malformed provenance as before.
+                    pass  # audio_source reports unreadable sidecars separately.
         source = audio_source(audio) if audio else None
         if audio is None and not local_only and not dry_run:
             auth = {"cookiejar": cookiejar} if cookiejar is not None else {}
@@ -990,8 +1040,8 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
                 mask = remaining["track_id"] == tid
                 remaining.loc[mask, "attempts"] += 1
                 remaining.loc[mask, "last_error"] = message
-            # Service challenges are not evidence that a track cannot be found.
-            # Record the reason without spending its retry allowance.
+            # Authentication and service challenges do not prove a track is unavailable.
+            # Save the reason without using up a track attempt.
             for tid, message in deferred.items():
                 remaining.loc[remaining["track_id"] == tid, "last_error"] = message
             atomic_csv(remaining, backlog_path)
@@ -1032,8 +1082,8 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
                 prepared = ready.popleft()
                 future = analysis_pool.submit(analyze_track, prepared, analysis_seconds)
                 analyzing[future] = str(prepared["item"]["track_id"])
-            # Reserve a queue slot for every acquisition in flight, so finished
-            # downloads can always be collected without blocking either stage.
+            # Reserve space for each download in flight. Finished downloads can then
+            # enter the ready queue without blocking either worker pool.
             while (not exhausted and not acquisition_blocked and len(acquiring) < acquisition_workers
                    and len(ready) + len(acquiring) < queue_size):
                 item = next(iterator, None)
@@ -1085,8 +1135,8 @@ def process(backlog_path: Path = BACKLOG_PATH, master_path: Path = MASTER_PATH,
                     checkpoint()
         checkpoint()
     except KeyboardInterrupt:
-        # Completed results already collected by the coordinator are safe to save;
-        # in-flight tracks retain their backlog entries and their audio cache.
+        # Save completed results already collected by the coordinator.
+        # Tracks still in flight keep their backlog entries and cached audio.
         if not checkpoint_started:
             checkpoint()
         LOG.warning("Interrupted; completed checkpoints are retained, remaining backlog entries can be retried")

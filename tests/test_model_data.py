@@ -51,7 +51,7 @@ def test_store_and_dataset_padding_are_separate_from_feature_availability():
     assert batch['padding_mask'].tolist()==[True,True,False]
     assert batch['context']['artist_mask'].squeeze(-1).tolist()==[0,0,1]
     assert not batch['context']['numeric_mask'].any()
-    assert batch['negative']['numeric_mask'].any()  # only 'n' is eligible
+    assert batch['negative']['numeric_mask'].any()  # Only track 'n' is eligible as a negative.
 
 
 def test_negative_sampling_never_hangs_when_pool_is_exhausted():

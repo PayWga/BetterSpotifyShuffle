@@ -103,7 +103,7 @@ class SpotifyRequestBudget:
                                        f"Retry no earlier than {utc_text(state['blocked_until'])}.")
         recent = sorted(t for t in state['attempts'] if t > now - WINDOW)
         if self.limit is not None and len(recent) >= self.limit:
-            # If the configured budget is lowered, enough entries must expire.
+            # A lower budget may need several old attempts to expire before requests can resume.
             retry_at = recent[len(recent) - self.limit] + WINDOW
             raise SpotifyBudgetBlocked(f'Local metadata budget of {self.limit} HTTP attempts per rolling '
                                        f'24 hours reached. Retry no earlier than {utc_text(retry_at)}.')
