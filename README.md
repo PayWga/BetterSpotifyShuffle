@@ -1,735 +1,351 @@
 # ShuffleRec
 
-Personal music recommendation and sequencing experiments using Spotify listening
-history, track metadata and audio features, and a SASRec-inspired Transformer.
+**Personal music recommendation and adaptive sequencing with a SASRec-inspired Transformer.**
 
-- `scripts/polling.py` collects plays and skips from Spotify playback.
-- `scripts/import_etended_spotify_history.py` imports extended listening history.
-- `scripts/data_merging.py` manages the master catalog and Spotify metadata sync.
-- `scripts/spotify_metadata.py` provides shared missing-only Spotify enrichment.
-- `scripts/metadata_fetcher.py` tracks play/skip counts and library age.
-- `notebooks/ShuffleRec.ipynb` prepares sequences and trains next-item and preference models.
-- `scripts/feature_extraction.py` finds audio and fills missing acoustic measurements.
+ShuffleRec combines Spotify listening history, track metadata, and audio features to recommend what to play next. The model uses recent listening context to rank tracks, while a separate sequencer builds a queue that balances those rankings with variety and responds to playback feedback.
 
-## Environment setup
+The project covers the full path from raw listening records to live playback: importing and normalizing history, maintaining a shared track catalog, extracting missing acoustic measurements, training and comparing models, and connecting local inference to Spotify. This README describes the work completed so far, the evidence behind the current choices, and the limitations that still need further experimentation.
 
-Use one Python environment for the notebook kernel and the command-line tools.
-Install the dependency sets needed for each workflow:
+## Contents
 
-| Workflow | Requirement files |
+- [Project structure](#project-structure)
+- [Data pipeline](#data-pipeline)
+- [Dataset snapshot](#dataset-snapshot)
+- [Features and missing data](#features-and-missing-data)
+- [Model architecture](#model-architecture)
+- [Training and evaluation](#training-and-evaluation)
+- [Preliminary model comparison](#preliminary-model-comparison)
+- [Adaptive sequencing and live playback](#adaptive-sequencing-and-live-playback)
+- [Setup and usage](#setup-and-usage)
+- [Reproducing the figures](#reproducing-the-figures)
+- [Current limitations and further work](#current-limitations-and-further-work)
+- [Detailed guides](#detailed-guides)
+
+## Project structure
+
+| Location | Role |
 | --- | --- |
-| Model training and offline sequencing | `requirements-model.txt` |
-| Spotify playback and live sequencing | `requirements-model.txt` and `requirements-spotify.txt` |
+| `notebooks/ShuffleRec.ipynb` | Main notebook for data preparation, model training, feature comparisons, and evaluation |
+| `shufflerec/` | Shared preprocessing, chronological datasets, model, training, inference, and sequencing logic |
+| `scripts/` | History import, playback polling, catalog merging, metadata enrichment, and audio extraction |
+| `data/` | Master track table, extraction backlog, and private metadata checkpoints |
+| `sensitive_info/` | Private history, source datasets, credentials, runtime settings, and model artifacts |
+| `tests/` | Offline regression tests using synthetic data and simulated services |
+| `docs/` | Workflow guides and the aggregate figures used below |
+
+Private listening data, credentials, audio caches, and trained personal checkpoints are kept out of Git. A fresh checkout needs its own data and credentials to reproduce the personal workflow.
+
+## Data pipeline
+
+The master catalog and listening history serve different purposes. Catalog rows describe tracks; history rows describe individual listening events. They are connected through the catalog's `id` field and the history's `track_id` field. The extraction backlog also uses `track_id`.
+
+```mermaid
+flowchart TD
+    C[Source track datasets] --> M[Master track catalog]
+    H[Extended Spotify history] --> N[Normalize and deduplicate UTC events]
+    P[Playback polling] --> N
+    N --> L[Listening history]
+    L --> R[Recover missing track metadata]
+    S[Spotify metadata enrichment] --> R
+    R -->|Missing-only fills| M
+    M --> B[Missing-feature backlog]
+    B --> A[Match recordings and acquire audio]
+    A --> X[Local acoustic analysis]
+    X -->|Measurements and per-feature provenance| M
+    L --> D[Chronological session preparation]
+    M --> D
+    D --> T[Training and validation]
+    T --> K[Checkpoint with frozen preprocessing]
+    K --> I[Local inference and adaptive sequencing]
+    I --> Q[Spotify queue additions]
+    Q --> P
+```
+
+### Listening history and metadata
+
+Extended Spotify exports are imported through `scripts/import_etended_spotify_history.py`; `scripts/polling.py` records new playback observations. Timestamps are normalized to UTC, and supported history sources are combined and deduplicated before use.
+
+Catalog enrichment starts with information already available locally: alternate catalog columns, history exports, retained source records, and saved metadata responses. Spotify requests fill remaining gaps. Existing nonmissing values are preserved, and newly recovered metadata retains field-level provenance.
+
+Duration needs particular care. Time spent listening is not automatically the recording's duration. Unqualified history values remain candidates, while consistent completed-play evidence can supply explicitly labeled estimates. The default model preprocessing excludes durations marked as estimated.
+
+### Audio acquisition and analysis
+
+`scripts/feature_extraction.py` first checks the local audio cache. If audio is unavailable, it searches for a recording and checks title, artist, version, and available duration evidence before downloading. Requested remixes, language versions, and live recordings are treated as distinct recording identities. These checks reduce mismatches, but cannot prove that a source is the exact Spotify recording.
+
+Acquisition and analysis use separate worker pools, with one coordinator responsible for catalog updates. The default analysis window is the first 60 seconds; full-recording analysis is also available. Each newly filled feature records its extractor version, audio source, and actual analyzed duration. Failed attempts remain in the backlog with an error reason for later review.
+
+Updates are missing-only. Atomic CSV replacement and change detection protect ordinary saves, but concurrent writers to the same catalog or backlog are unsupported. Metadata can be fetched into a separate checkpoint while extraction runs, then applied after the other writer has stopped.
+
+The [data pipeline reference](docs/data-pipeline.md) covers matching rules, local recovery, staged metadata fetching, retries, authentication, and interrupted-save recovery.
+
+## Dataset snapshot
+
+The following figures summarize the local inputs inspected on **31 October 2026**. They are a snapshot of an evolving dataset, rather than fixed properties of the project or the inputs used by every earlier experiment.
+
+| Dataset | Size |
+| --- | ---: |
+| Master catalog | 1,379,224 track records |
+| Listening history | 310,705 events |
+| Distinct track identifiers in history | 8,170 |
+| Catalog rows matched to history | 6,974 |
+
+The history identifier count is measured before matching to the catalog or filtering model inputs. It should not be read as the number of usable training tracks.
+
+### Listening-event composition
+
+![Counts and proportions of listening-history event labels](docs/images/listening_events.png)
+
+Most recorded events are labeled `PLAY`, followed by `GHOST_SKIP` and `NEUTRAL`. Rows without an event label are shown separately. These are the labels already stored in the history, rather than labels reconstructed for this figure. Neutral and unrecognized events reset training context; they are not silently treated as positive plays.
+
+### Feature availability
+
+![Feature availability across the full catalog and history-matched catalog rows](docs/images/feature_availability.png)
+
+The two groups answer different questions: how complete is the full catalog, and how much information is available for tracks that occur in listening history? Coverage is measured per catalog row, so frequently played tracks do not receive extra weight.
+
+The plot applies the preprocessing value checks and excludes explicitly estimated durations. It shows supplied feature availability before training-only calibration; a feature with no valid training observations will still be masked by the fitted preprocessor. Local measurements cover less than 1% of the full catalog, but roughly 70% of its history-matched tracks. That difference makes the smaller group a useful view of the data available for personal recommendations.
+
+### Acoustic distributions
+
+![Tempo, local RMS level, spectral centroid, and beat regularity for history-matched tracks](docs/images/acoustic_distributions.png)
+
+These distributions use history-matched catalog rows, with one observation per track record. Each panel reports its own valid sample count because feature coverage differs. Values outside the displayed ranges are counted in the panel captions rather than clipped into the edge bins. The local measurements describe the analyzed audio segment, which may cover only part of a recording.
+
+## Features and missing data
+
+The feature pipeline combines numerical measurements with categorical metadata. Input groups can be enabled independently for comparisons, and the same fitted transformations are saved with the model for inference.
+
+| Feature group | Inputs and handling |
+| --- | --- |
+| Original audio properties | Danceability, energy, loudness, speechiness, acousticness, instrumentalness, liveness, valence, tempo, and mode |
+| Musical key and meter | Circular sine/cosine key encoding and a categorical time-signature embedding in the compact preset; alternative encodings remain available |
+| Track metadata | Artist identities, represented release year, duration, and track genre; artist genres use a separate vocabulary when present |
+| Local acoustics | RMS level in dB, onset strength, spectral centroid in Hz, spectral contrast, and beat regularity |
+| Extraction provenance | Availability of recognized local extraction markers and log-transformed analysis durations for locally extractable properties |
+| Optional inputs | Album identity and popularity are configurable; explicit-content flags are not model inputs |
+
+Local RMS level is not Spotify loudness, onset strength is not energy, and beat regularity is not danceability. These measurements remain separate features so the model can learn whether they contribute useful information.
+
+Missing numeric data uses NaN in the source tables. During transformation, values receive numerical inputs and separate availability masks. A missing value therefore remains distinguishable from a real zero. Invalid legacy sentinels are rejected according to each feature's meaning; negative dB values remain valid where appropriate.
+
+Category vocabularies and numerical ranges are fitted on training-session tracks only. Unknown categories, missing features, and sequence padding are handled separately. Artist and genre lists are pooled into fixed-width representations, while track genres and artist genres retain their separate meanings. Unused source metadata stays in the catalog for future experiments.
+
+## Model architecture
+
+The current network uses a shared track encoder and a single causal Transformer layer. It is inspired by SASRec's sequential ranking approach, with track representations built from attributes rather than a dedicated learned embedding for every track ID. This allows a new track with usable metadata or acoustic features to be represented without adding an item-specific embedding.
+
+```mermaid
+flowchart TD
+    N[Validated numeric features] --> V[Values and availability masks]
+    C[Artist, genre, and optional category IDs] --> E[Category embeddings and pooling]
+    E --> CM[Pooled embeddings and category masks]
+    V --> CAT[Concatenate feature blocks]
+    CM --> CAT
+    CAT --> ENC[Shared linear track encoder]
+    ENC --> CTX[Recent context track vectors]
+    ENC --> CAN[Candidate track vectors]
+    CTX --> POS[Add positional embeddings]
+    POS --> TR[One causal Transformer encoder layer]
+    MASK[Causal mask and separate padding mask] --> TR
+    TR --> STATE[Final real context position]
+    STATE --> SCORE[Dot-product candidate scores]
+    CAN --> SCORE
+    SCORE --> RANK[Ranked candidates]
+```
+
+The default architecture uses a **128-dimensional track representation**, **8 attention heads**, a **2,048-dimensional feed-forward block**, and **0.1 dropout**. The notebook uses up to **10 context tracks**. Shorter contexts are right-aligned and padded, with padding excluded from real-position attention.
+
+Context and candidate tracks pass through the same track encoder. The last real context state is scored against candidate vectors using dot products. These scores express relative ranking, not calibrated probabilities of acceptance. At inference, candidate vectors can be cached while context states are recomputed for each planned slot.
+
+Parameter counts depend on enabled features and training vocabularies. The saved compact-encoding comparison model below has **616,500 parameters**; this is a property of that fitted run, rather than a fixed network size for all datasets.
+
+## Training and evaluation
+
+### Chronological preparation
+
+Events are grouped into sessions using a **20-minute gap**. Complete sessions are split approximately **80/10/10 by session count** into training, validation, and test partitions. Event and example proportions can differ from those percentages, and context never crosses a partition boundary.
+
+Accepted historical plays extend context and form next-item targets. Ghost skips can provide negative preference pairs against a subsequent play. Neutral events and tracks without usable model inputs reset context, preserving the same behavior in training and inference.
+
+### Ranking objective and model selection
+
+Training uses a pairwise ranking loss that favors a positive track over a negative one. The workflow supports a next-item phase followed by an optional skip-preference phase. Validation NDCG selects the best weights across both phases, so a weaker preference phase does not replace a better next-item checkpoint.
+
+The current notebook selects a single `compact_encoding` training run. Comparisons are available separately, and the current settings leave preference training and final-test evaluation disabled. Review the settings cell before running the notebook: executing all cells can start training, even though simply opening it does not.
+
+### What the metrics measure
+
+Evaluation uses **Hit@10** and **NDCG@10**. Hit@10 measures whether the target appears in the first ten positions; NDCG@10 also rewards placing it nearer the top.
+
+The default evaluation samples up to 99 unique negatives per target, excluding context tracks. Candidate identities and ordering are fixed for repeated validation checks. Feature comparisons use common validation examples and candidate sets so that the variants face the same ranking task.
+
+These are sampled ranking metrics. They do not measure full-catalog retrieval or establish how well a live session will perform. The default candidate universe is a retrospective catalog snapshot of tracks occurring in the supplied history, including held-out identities. It does not reconstruct which tracks or metadata were available at each historical moment.
+
+Checkpoints package model weights, configuration, fitted preprocessing, and run metadata together. They are inference artifacts rather than optimizer-state resumptions, and should remain private because they contain fitted personal vocabularies and weights. See the [model workflow guide](docs/model-training.md) for configuration and artifact details.
+
+## Preliminary model comparison
+
+The saved **28 October 2026** feature-group comparison provides an initial view of how the input choices affect ranking. All four variants were evaluated on **500 shared validation examples**, with **100 candidates per example**, using seed **42**.
+
+![Sampled validation Hit at 10 and NDCG at 10 for four feature configurations](docs/images/model_comparison.png)
+
+| Variant | Main input change | Hit@10 | NDCG@10 | Parameters |
+| --- | --- | ---: | ---: | ---: |
+| Audio baseline | Audio properties with the baseline key/meter encodings | 0.280 | 0.119 | 597,504 |
+| Metadata | Adds artist, genre, year, and duration inputs | 0.652 | 0.465 | 616,104 |
+| Compact encoding | Uses circular key and categorical time-signature encoding | 0.646 | 0.468 | 616,500 |
+| Extended acoustics | Adds local acoustic measurements and extraction provenance | 0.644 | 0.454 | 621,876 |
+
+The largest improvement in this run came from adding metadata. Compact encoding produced the highest NDCG@10, while the metadata variant had the highest Hit@10. Their small difference needs repeated experiments before it can support a stronger conclusion. Adding local acoustics did not improve the recorded validation scores in this comparison.
+
+These results come from one saved experiment, without repeated-seed uncertainty estimates. The report records no final-test evaluation. Its source snapshot also predates the current dataset figures, so the two should not be interpreted as one freshly repeated experiment. A later standalone compact-model training run is a separate result and is not mixed into this comparison.
+
+## Adaptive sequencing and live playback
+
+Ranking a track and deciding to queue it are separate steps. The sequencer combines three candidate pools:
+
+| Pool | Purpose |
+| --- | --- |
+| Random | Keep some exploration within the supplied playlist |
+| Top-ranked | Favor tracks with strong model scores |
+| Filtered | Introduce artist/genre relationships with rank weighting and variety controls |
+
+Pool preferences adapt to acceptance and rejection feedback. Recent-track exclusions, fatigue penalties, and duplicate checks help avoid repetitive queues. The default plan contains **five upcoming tracks**. Later slots use earlier planned tracks as provisional context; unheard suggestions never become confirmed listening history just because they were planned.
+
+This adaptation changes sequencing policy and future selections. The model weights and fitted preprocessing remain frozen during playback.
+
+### Offline and live operation
+
+The offline interface takes playlist IDs and accepted context from local CSV files and supports JSON feedback without contacting Spotify. The live pipeline reads the active Spotify playlist, prepares local inference, and replenishes the upcoming queue as playback progresses.
+
+Live queue additions are committed once Spotify acknowledges them. Feedback changes future additions, but cannot freely replace songs already submitted. The pipeline preserves manually queued songs and withholds additions when playback or source conditions do not permit them. It does not start playback, transfer devices, skip tracks, clear the queue, or edit the playlist.
+
+Playback tracking uses conservative evidence when observations are missing. Uncertain intervening tracks are not fabricated as measured listening-history rows; separate feedback records retain the inference and confidence information.
+
+### Feedback thresholds
+
+Historical training labels and live acceptance answer different questions and deliberately use different thresholds:
+
+| Signal | Default interpretation |
+| --- | --- |
+| Historical `PLAY` | At least 70% completion, or an explicit completed-track reason |
+| Historical `GHOST_SKIP` | Confirmed skip below 15% completion under the history classifier |
+| Sequencer acceptance | At least 25% completion |
+| Early sequencer rejection | Below 25%, with qualifying skip/transition evidence |
+
+Incomplete or uncertain observations may remain neutral or unresolved. The [adaptive playback guide](docs/adaptive-playback.md) explains evidence weights and polling behavior; the [sequencing guide](docs/sequencing.md) describes pool controls and feedback commands.
+
+## Setup and usage
+
+Run commands from the repository root, using the same Python environment for the notebook kernel and command-line tools.
+
+### Dependencies
+
+| Workflow | Requirements |
+| --- | --- |
+| Training and offline inference | `requirements-model.txt` |
+| Live Spotify integration | Model requirements plus `requirements-spotify.txt` |
 | Audio acquisition and extraction | `requirements-audio.txt` |
-| All workflows and tests | All three files |
+| README plots | `requirements-docs.txt` |
 
 ```powershell
-python -m pip install -r requirements-model.txt -r requirements-spotify.txt -r requirements-audio.txt
-python -m pytest -q
+python -m pip install -r requirements-model.txt -r requirements-spotify.txt -r requirements-audio.txt -r requirements-docs.txt
 ```
 
-Audio extraction also needs FFmpeg and ffprobe on PATH. YouTube acquisition uses
-Node.js or Deno as described below. The requirement files allow compatible
-version ranges; they do not lock an exact environment. An environment snapshot
-can be kept beside private model artifacts with
-`python -m pip freeze > sensitive_info/model_runs/YOUR_RUN/environment.txt`.
+Audio processing also needs **FFmpeg and ffprobe** on PATH. YouTube extraction uses **Node.js 22+ or Deno 2.3+** for JavaScript support. Notebook use needs Jupyter and a kernel in the selected environment. Dependency files specify compatible ranges rather than an exact environment lock.
 
-## Live pipeline
+Spotify integration uses private OAuth credentials in `sensitive_info/spotify_credentials.json`, with `client_id`, `client_secret`, and `redirect_uri`. Live operation additionally reads `sensitive_info/spotify_pipeline.json` to select a local checkpoint and runtime settings. Use placeholder examples from the [live guide](docs/live-pipeline.md) and [playback guide](docs/adaptive-playback.md); personal credentials and model files are not bundled.
 
-Start a playlist on your PC or phone, then run `python -m shufflerec.live` from
-the project root. The pipeline loads the current playlist, runs local inference,
-maintains five upcoming recommendations, and learns from playback observations.
-Use `python -m shufflerec.live --dry-run --once` to preview without queue changes.
-See [the live pipeline guide](docs/live-pipeline.md) for private settings, proxy
-switches, authorization and command recovery.
-
-## Offline sequencing
-
-`python -m shufflerec.sequence --help` starts the local inference/sequencing
-interface. It loads a selected checkpoint once, caches track embeddings, and
-plans adaptive five-song queues without connecting to Spotify. See
-[the sequencing guide](docs/sequencing.md) for file inputs, JSON feedback commands,
-pool configuration, and session-state limitations.
-
-`scripts/polling.py` now uses the shared adaptive playback tracker: 15-second
-checks before acceptance and up to 75 seconds afterward, with conservative queue
-evidence and separate private feedback records. See
-[adaptive playback](docs/adaptive-playback.md) for credential paths, polling
-options, and the submitted-selection interface.
-
-## Audio feature extraction
-
-Install Python dependencies with `python -m pip install -r requirements-audio.txt`.
-Install FFmpeg and ffprobe on PATH. Node.js 22+ or Deno 2.3+ is recommended for
-YouTube extraction. The script automatically enables either installed runtime.
-The `yt-dlp[default]` dependency includes its JavaScript challenge solver; see the
-[upstream setup guide](https://github.com/yt-dlp/yt-dlp/wiki/EJS).
-
-From the repository root:
+### Inspect and prepare data
 
 ```powershell
-# Inspect up to 10 entries using existing audio only; no files or downloads change.
-python scripts/feature_extraction.py --dry-run --limit 10
+# Read-only aggregate audit of the catalog and history.
+python -m shufflerec.audit --master data/master_track_table.csv --history sensitive_info/spotify_listening_history.csv
 
-# Search/download missing audio and extract features for up to 10 tracks.
-python scripts/feature_extraction.py --limit 10
-
-# Process all eligible tracks without online search.
-python scripts/feature_extraction.py --local-only
-
-# Include entries that reached the attempt cap, after resolving their errors.
-python scripts/feature_extraction.py --retry-failed --limit 10
-
-# Keep acquisition ahead of analysis (these are the default pool sizes).
-python scripts/feature_extraction.py --limit 100 --acquisition-workers 8 --analysis-workers 4
-
-# Analyze complete recordings rather than the first minute.
-python scripts/feature_extraction.py --limit 100 --analysis-seconds full
-```
-
-Default inputs are `data/dsp_backlog.csv` (`track_id`, optionally `track_name`,
-`artist_name`, `duration_ms`) and `data/master_track_table.csv` (`id`). Missing
-search metadata is filled from the master catalog. `artists` can be a single
-artist or a string containing a Python list of artist names. Use `--backlog`,
-`--master`, and `--audio-dir` to select separate files/directories. Relative CLI
-paths are resolved from the working directory; default paths use the project root.
-
-Local audio must be named `<track_id>.wav`, `.flac`, `.mp3`, `.ogg`, or `.m4a` in
-`data/temp_audio`. If absent, the script searches five YouTube results, checks
-artist and title, rejects conflicting version labels, and compares duration when
-available (tolerance: 12 seconds or 12%, whichever is greater). It tries ranked
-matches until a download succeeds. If none succeeds, a second, broader query
-examines up to ten results without the "official audio" qualifier. Already tried
-URLs are not downloaded again. If both fail, a third query examines up to fifteen
-results using the primary artist and core title, retaining requested version
-checks. A final primary-artist/core-title query examines up to fifteen lyric
-video results without requiring a remaster label in the query. Queries can
-overlap; a candidate is attempted only once per track/run.
-The same final matching checks apply to all searches.
-These checks are heuristic and cannot prove
-that a result is the exact Spotify recording. Use recordings with appropriate
-permissions, and inspect cached `<track_id>.source.json` files when reviewing matches.
-Downloaded audio is converted to WAV and retained for retries. By default the
-first 60 seconds are analyzed. `--analysis-seconds full` analyzes the entire
-recording; a positive number selects another limit, e.g. `--analysis-seconds 120`.
-Full-song mode offers broader coverage, not a guarantee of more accurate key or
-tempo, and takes more CPU time and memory. Allow disk space for full recordings
-in either mode; download quality and source selection are unchanged.
-Each candidate downloads into a separate staging directory. Failed staging files
-are retained for inspection; only successful WAV conversions and their source
-sidecars are published into the cache root.
-Publication uses a per-track `.publication.json` marker. A pending or invalid
-marker blocks cache reuse until both the WAV and sidecar have been published and
-their signatures committed. A failed publication retains staged files and any
-previous cache backup; an online rerun can publish a fresh pair. Keep these
-markers with their recordings. Older unmarked local caches remain supported.
-This protects the application's cache reads after interrupted replacements;
-it does not coordinate concurrent cache writers or guarantee recovery from
-power loss.
-
-Matching tolerates apostrophe variations, `feat`/`ft` credits, equivalent
-`remaster`/`remastered` wording, comma/semicolon-separated artist credits, and
-VEVO channel suffixes, and presentation labels such as "Audio Only", "Full
-Audio", "Unofficial Lyrics Video", "Fan Made Lyric Video", and "Reupload".
-An official uploader is not required. Controlled presentation brackets (including
-lyric/Letra/Paroles labels and lyric-video author credits) are ignored when
-checking the song title; a different song merely containing the requested title
-is still rejected. When a search result
-matches the title/version/duration and primary artist but lacks collaborator
-credits, full metadata is fetched without downloading audio. Structured artist
-and creator fields can then establish the missing credits. If guest credits
-remain absent, a candidate can qualify only when the primary artist/title match
-and known duration differs by no more than **3 seconds or 2%, whichever is
-greater**. The same tighter duration rule permits a requested remaster to use an
-upload that omits its remaster label/year. This does not verify the exact master;
-an explicitly conflicting remaster year remains rejected. Missing duration is
-insufficient for either relaxation. Complete credits and explicit remaster
-matches rank above relaxed alternatives with otherwise equal evidence.
-Matching separates the base title from featured credits and recording labels.
-`(with Future)` and `(feat. Future)` are equivalent; Japanese `Version`/`Ver.`
-and explicit `(Japanese)` labels agree. Explicit language labels are required:
-an unmarked/Korean upload cannot substitute a Japanese version. Live/studio and
-stripped/regular recordings remain distinct. A non-Latin title with an explicit
-Latin-script alias can match that alias, e.g. `붐바야 (BOOMBAYAH)`. Artist/title
-order and recognized pipe-delimited lyric/uploader branding are handled without
-accepting unrelated additional song names. Fallback queries retain known
-language/live/stripped constraints.
-Source sidecars record `match_evidence` when guest/remaster identity is relaxed,
-using matching policy `structured_recording_identity_v6`.
-
-**A remix is eligible only when the backlog track itself requests a remix.** Remix/RMX,
-re-mix/remixed, bootleg, mashup, rework and alternate club/dance/DJ/extended/dub/
-festival mix labels are checked before presentation text is stripped. Candidate
-title, track, alternate-title, version and tag fields are checked, together with
-remixer credit fields. A requested named remix must match its title/version;
-an original or a different named remix is rejected. RMX, re-mix and remixed
-spellings normalize to remix. Plain "Original Mix" is allowed for originals;
-a generic unexplained "Mix" label is not. These checks depend on supplied metadata and cannot detect
-an unlabelled remix by listening to the waveform.
-The previous unconditional filter's `excluded_remix` status no longer suppresses
-tracks: these entries are eligible again even above the normal attempt limit,
-without resetting stored counters or requiring a manual CSV edit. No rows or
-existing features are deleted. Cached audio with incompatible remix sidecar
-metadata is bypassed and retained on disk while a matching recording is sought;
-cached audio for the requested remix remains usable.
-Different titles, conflicting cover/live versions, and duration conflicts remain
-rejected. After download, resolved metadata is checked
-again before the WAV and source sidecar are published; rejected downloads stay
-in their isolated staging directories.
-
-The extractor estimates `tempo`, `key`, and `mode`, and adds separate descriptors:
-`local_rms_db`, `local_onset_strength`, `local_spectral_centroid` (Hz),
-`local_spectral_contrast`, and `local_beat_regularity` (0–1). They are **not**
-replacements for Spotify energy, loudness, danceability, or instrumentalness.
-Unreliable measurements remain NaN. Every newly filled feature has a
-`<feature>_source` extractor version, `<feature>_audio_source` path/URL, and
-`<feature>_analysis_seconds` actual analyzed duration. Existing features retain
-their original provenance and duration. Old measurements with no duration remain
-unknown; their analysis scope is not guessed.
-Existing nonmissing values and unrelated metadata are preserved.
-
-Each run visits eligible backlog entries once. Acquisition and analysis have
-separate thread pools: `--acquisition-workers` defaults to **8**, and
-`--analysis-workers` to **4**. More downloads can proceed while the analysis pool
-processes ready recordings. One coordinator still owns all catalog updates.
-`--queue-size` limits ready audio paths plus reserved slots for acquisitions in
-flight; it defaults to the greater of acquisition workers and twice analysis
-workers. A smaller queue can intentionally limit acquisition concurrency.
-The queue contains paths and metadata, not decoded waveforms. Only analysis
-workers load signals, keeping analysis memory usage bounded.
-
-`--workers N` remains a compatibility shorthand that sets both pools to N;
-explicit stage-specific options override it. Thus `--workers 1` means one worker
-in each stage, which can still overlap acquisition with analysis. Scientific
-library work can run outside Python's interpreter lock; actual gains depend on
-the computer, recordings, network responses, and memory pressure. Reduce
-analysis workers if memory is tight, especially in full-song mode. Workers
-receive individual track records, not copies of the master catalog. A slow
-recording does not block the checkpointing of completed recordings.
-
-The master is read once per run. Newly added rows are appended together once per
-checkpoint, rather than rebuilding the master for every track. `--batch-size`
-now defaults to **100 completed tracks per checkpoint**, instead of 10. This
-reduces full CSV rewrites; it does not control concurrency. Use `--batch-size 10`
-for more frequent saves at greater disk/serialization cost. `--max-attempts`
-still defaults to 3. Failed entries retain an attempt count and error reason;
-successful entries are removed only after their master updates are saved.
-With `--retry-failed`, tracks are selected by lowest attempt count first, keeping
-backlog order for ties, before applying `--limit`. Thus genuine failures move
-behind less-attempted tracks on later limited runs. Service-deferred tracks keep
-their attempt counts and may be selected again until service access is restored.
-
-Ctrl+C attempts to checkpoint results already collected by the coordinator;
-in-flight tracks retain their backlog entries and cached audio for a later run.
-Active workers may take time to finish before shutdown. If Ctrl+C interrupts a
-checkpoint itself, it is not repeated, avoiding double-counted failure attempts.
-A forced termination can require reanalysis since the previous checkpoint.
-
-CSV writes use atomic replacement, but concurrent catalog/backlog writers are
-not supported. A timestamp/size check aborts saving if another process changed a
-CSV since the previous checkpoint; this is a conflict check, not a multi-process
-lock. Back up the catalog before large runs and finish other writer jobs first.
-If Windows denies CSV replacement (for example, a reader holds it open without
-delete sharing), the writer retries the same prepared file up to six times over
-about eight seconds; it does not serialize the whole table again. It aborts if
-the destination changes during preparation/retries. Persistent access denial
-produces an actionable error and a nonzero exit. The complete prepared CSV is
-retained beside the destination as a hidden `.master_track_table_*.csv` or
-`.dsp_backlog_*.csv` snapshot; its path is printed. A retained snapshot is not
-automatically applied on restart because a later run or another writer may have
-changed the catalog. Do not replace newer data with it without reviewing the
-current state. Incomplete serialization artifacts are not kept as snapshots.
-If the master replacement fails, that checkpoint does not remove successful
-tracks from the backlog. Downloaded audio remains cached, so a normal rerun can
-reuse it, although unsaved feature analyses will run again.
-Logs report load time, acquisition and analysis time per track, checkpoint time,
-and total wall time. Acquisition also reports search, resolving/downloading, and
-FFmpeg conversion time. Summed worker times can exceed wall time because stages overlap.
-
-Failures now distinguish `no_search_results`, `no_matching_recording`,
-`missing_search_metadata`, `invalid_audio`, and search/download errors with codes
-such as `http_403`, `http_429`, `authentication_required`, `network_timeout`,
-`geo_restricted`, `session_reload_required`, and `js_challenge_failed`. Geographic
-classification requires an explicit country/region restriction in the error;
-ordinary unavailable/deleted recordings remain separate. Not every upstream
-error exposes a specific cause.
-Rejected candidate counts are deduplicated by URL/reason. Unsuccessful searches
-also log up to five candidate examples with rejection reason, title, uploader and
-URL. URL credentials, fragments and arbitrary query tokens are omitted. Redirect
-console output to a private log if you want to review these examples later.
-The run ends with a failure histogram. Authentication, session-reload, JavaScript
-challenge and HTTP 429 errors stop that track's candidate and fallback-search
-retries immediately. Three challenged tracks (any mix of authentication,
-session-reload or JavaScript errors) in one run, or a single HTTP 429, pause new
-acquisition for the rest of that run.
-Already-started acquisitions and queued/active analyses finish and checkpoint
-normally; there is no automatic timed resume. Challenged tracks record their
-error without increasing `attempts`. Unstarted tracks remain unchanged. The
-final JSON includes `deferred` when service challenges occurred; after a pause
-it includes both challenged and unstarted eligible tracks. These errors also
-appear in the error histogram, but are excluded from the `failed` track count.
-The threshold counts challenges across the run, not only consecutive failures.
-Check YouTube access before retrying; no cookie/browser access is automatic.
-To use the authentication options suggested by yt-dlp, first open YouTube in
-your browser on the same connection and complete any verification it presents,
-then select that browser explicitly:
-
-```powershell
-python scripts/feature_extraction.py --cookies-from-browser chrome --acquisition-workers 1 --limit 5
-```
-
-Replace `chrome` with `edge` or `firefox` as appropriate. A specific profile is
-accepted as `BROWSER:PROFILE`, for example `--cookies-from-browser "chrome:Default"`.
-If browser cookie access/decryption fails, close the browser and retry, or use
-an exported Netscape-format cookie file:
-
-```powershell
-python scripts/feature_extraction.py --cookies sensitive_info/youtube-cookies.txt --acquisition-workers 1 --limit 5
-```
-
-Choose one cookie source. Authentication is loaded once before processing,
-then copied into each yt-dlp context in memory. The script does not export
-browser cookies or overwrite the supplied cookie file. Loading errors stop the
-run before track attempts/CSV updates. Dry-run and local-only modes never read
-cookie files or browser cookies. Cookies are session credentials: keep exports
-private in the ignored `sensitive_info` directory. Account cookies can still be
-challenged or expire, and automated account access can lead to restrictions;
-see the official [cookie FAQ](https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp)
-and [YouTube guidance](https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies).
-
-For a small subsequent test, use `--acquisition-workers 1 --limit 5`.
-This reduces concurrent requests but does not enforce a request-rate limit.
-Earlier runs may already have exhausted attempts; `--retry-failed` makes those
-entries eligible again without resetting their stored attempt counts.
-These improvements cannot guarantee recovery of unavailable or
-unidentifiable recordings; older `audio_not_found` records do not identify the
-original cause. Retrying with `--retry-failed` uses the new search/matching logic
-but includes all attempt-exhausted entries, not just the last run's failures.
-
-The calculations reuse magnitude and log-mel spectra. Rhythm retains Librosa's
-median onset aggregation, while the onset descriptor retains mean aggregation;
-the feature definitions and key-estimation algorithm are unchanged.
-
-The extractor deliberately preserves existing `-1` values because they are
-nonmissing CSV values. Use the placeholder cleanup below to normalize known
-unknown values to NaN before extraction. The notebook uses feature availability
-masks separately from sequence padding and supports individual `local_*` inputs.
-See [the model workflow](docs/model-training.md) for feature controls and evaluation.
-
-## Fill missing Spotify metadata
-
-### Enrich tracks in the audio backlog
-
-Backlog-only tracks may have no row in the master, so master backfill cannot
-supply their missing durations. With extraction and other backlog writers
-stopped, use the dedicated action:
-
-```powershell
-python scripts/data_merging.py --backfill-backlog --dry-run
-python scripts/data_merging.py --backfill-backlog --limit 50
-```
-
-After checking that small enrichment run, omit `--limit` to enrich the remaining
-backlog before retrying extraction. The enrichment limit and extraction limit
-can select different rows, so enriching only 50 rows does not guarantee that the
-next 50 extraction candidates have metadata.
-
-This reuses the existing private Spotify credentials/OAuth client and track API
-retry handling. It fills missing `duration_ms`, `isrc`, `track_name` and
-`artist_name`, and stores separate `spotify_track_name`, JSON
-`spotify_artist_names`, `spotify_resolved_id`, `spotify_metadata_source` and UTC
-`spotify_metadata_checked_at` fields. Existing values, attempts, last extraction
-errors, IDs and unrelated columns are preserved. Full Spotify artist credits
-are used for matching; the original displayed backlog identity is retained.
-Successful extraction carries enriched metadata into remaining gaps in the
-master, including tracks already present there.
-
-The action writes only the selected backlog (`--backlog PATH` can override it),
-not the master. It checkpoints approximately every 25 requests and on ordinary
-error/interrupt exit. Reruns skip rows with duration and both Spotify identity
-fields already present. ISRC is optional; unavailable ISRC alone does not cause
-repeated requests. API permission/authentication errors stop the run after saving
-completed enrichment; unavailable/invalid IDs get a separate
-`spotify_metadata_error`, leaving extraction attempt counts unchanged. Unknown
-response IDs are rejected unless Spotify explicitly links them to the requested
-ID. A timestamp/size conflict check aborts rather than overwriting a detected
-external update; concurrent backlog writers remain unsupported. Dry-run reads
-only: no authentication, API requests or writes.
-
-Metadata HTTP attempts start at least **10 seconds apart**, with an additional
-**five-minute rest after every 50 attempts**. Failed lookups, retries, and optional
-album/artist requests all count. Slow responses count toward the interval, so
-no extra interval delay is added when a request already took 10 seconds or longer.
-A monotonic gate protects calls within one process; persistent transport pacing
-also coordinates this project's metadata processes and survives restarts. Rest
-waits release the state-file lock and remain interruptible with Ctrl+C.
-
-There is **no default daily request cap**. The previous 200-attempts-per-day cap
-was a local guess, not an established Spotify limit, and is now disabled.
-The retained 24-hour attempt history is for diagnostics, not a quota restriction.
-The interval/rest defaults are conservative settings for sustained metadata
-fetching, not a promise of a safe Spotify threshold. Adjust `REQUEST_INTERVAL`,
-`REQUEST_REST_EVERY`, and `REQUEST_REST_SECONDS` in `scripts/spotify_metadata.py`
-when necessary. Playback polling and apps outside this metadata client are not
-coordinated; run one metadata job at a time and account for other API activity.
-
-Every Spotify 429 now stops immediately, even with a short `Retry-After`; it is
-never automatically retried. The transport recognizes `QUOTA_EXCEEDED` and
-persists the cooldown until `Retry-After` plus a one-minute safety margin.
-Missing or invalid retry times cause a conservative 24-hour pause. Completed backlog
-updates or master metadata checkpoints are saved first; rate limits do not spend
-audio-extraction attempts. The command exits with code 2 and displays the next
-UTC retry time when available. The HTTP session preserves original 429 headers
-so Spotipy cannot discard them in a `Max Retries` exception. This shared handling
-also applies to master metadata backfill. Rerun the same command only after the
-reported cooldown; restarting does not clear recorded cooldowns or batch rests.
-The command does not schedule a restart or shorten Spotify's restriction.
-`--sync` also stops on cooldown and saves successfully fetched records into
-missing master cells before exiting.
-
-Request timestamps, batch-rest state, and Spotify cooldowns live in
-`sensitive_info/spotify_request_budget.json`, protected by a sidecar file lock and
-atomic replacement. It contains no credentials or listening history. Keep the
-file: replacing a checkpoint does not reset it, unreadable budget state blocks
-requests, and manually deleting the file would discard this protection. Calls
-made before this safeguard was installed cannot be counted retroactively.
-Existing running metadata processes must be stopped and restarted to load it.
-
-```powershell
-# Inspect pacing/cooldown status without authenticating or making API requests.
-python scripts/data_merging.py --spotify-budget-status
-
-# Record a cooldown you already received. Seconds are measured from now;
-# this never shortens an existing pause or resets counted attempts.
-python scripts/data_merging.py --set-spotify-cooldown 80000
-```
-
-Dry-run, checkpoint application, and local-only fills consume no HTTP attempts.
-On a future 429, diagnostics include the available error reason and local counts
-for the preceding 30 seconds and 15 minutes. An absent reason is reported as
-unspecified; neither a long cooldown nor successful playback polling proves
-whether a metadata failure was a rate limit or a quota restriction. Spotify
-documents both [rolling-window rate limits](https://developer.spotify.com/documentation/web-api/concepts/rate-limits)
-and [separate quota buckets](https://developer.spotify.com/documentation/web-api/concepts/quota-modes).
-
-After enrichment, test extraction with your usual cookie option plus
-`--retry-failed --limit 20 --acquisition-workers 1`. Filling metadata does not
-reset the extraction attempt limit. Inspect rejected-candidate examples before
-scaling up; offline regression fixtures do not establish the recovery rate on
-your full catalog.
-
-### Fill audio-search metadata directly in the backlog
-
-Tracks absent from master also need metadata to acquire the right audio. This
-offline command fills missing cells in `data/dsp_backlog.csv` directly:
-
-```powershell
-python scripts/data_merging.py --backfill-backlog-local --dry-run
-python scripts/data_merging.py --backfill-backlog-local
-```
-
-It matches exact Spotify track IDs against the supported history CSV/JSON
-exports and master catalog, preserving backlog row order, existing values,
-attempt counts and error state. It supplies missing names/artists/albums,
-confirmed recording durations and available metadata. Existing structured
-`spotify_artist_names` lists from master are copied as lists, without guessing
-artist boundaries from a comma-separated credit. Conflicting local candidates
-are skipped and newly filled cells receive per-field source provenance.
-
-Confirmed durations include history rows labeled `polling` or `live_polling`,
-and explicit supported duration provenance. Unqualified durations are retained
-only as `history_duration_candidate_ms`. Repeated completed plays can also fill
-missing durations as explicitly labelled estimates, using the evidence rules
-below. Original track/version labels are preserved. Audio extraction uses
-the recovered `duration_ms`, `track_name`, `artist_name` and available Spotify
-artist lists on its next run. No acoustic features are inferred from history.
-
-By default this action never opens Spotify checkpoint files and never makes
-API calls. It writes only the backlog, so it can run alongside the existing
-`--backfill --fetch-only` job, which writes a separate checkpoint. Do not run it
-alongside extraction or backlog API enrichment, because those also write the
-backlog. Changing metadata does not alter an already-running job's in-memory
-catalog. The master and all history/source files remain unchanged.
-
-After fetch jobs finish, saved checkpoints can optionally contribute too:
-
-```powershell
-python scripts/data_merging.py --backfill-backlog-local --include-local-checkpoints --dry-run
-python scripts/data_merging.py --backfill-backlog-local --include-local-checkpoints
-```
-
-Use `--backlog PATH` to select a different target, and `--local-source-root PATH`
-for a source project root containing `data/` and `sensitive_info/`. A detected
-change to the target during processing aborts the write. The action neither
-inserts new backlog tracks nor resets extraction retries.
-
-### Fill the master from all supported local sources
-
-Run this before spending Spotify requests on missing metadata. Stop extraction
-and other master-table writers before applying changes:
-
-```powershell
-# Preview all fills and conflicts; no files change and no Spotify calls occur.
+# Preview missing-only metadata recovery from supported local sources.
 python scripts/data_merging.py --backfill-local --dry-run
 
-# Apply the same missing-only recovery to the master CSV.
-python scripts/data_merging.py --backfill-local
+# Inspect a small audio backlog sample using existing local audio only.
+python scripts/feature_extraction.py --dry-run --limit 10
 ```
 
-This single offline command combines:
+After reviewing the local metadata preview, omit `--dry-run` to apply the fills. Run only one writer per target CSV. For online enrichment, large audio runs, or recovery after errors, follow the [data pipeline reference](docs/data-pipeline.md).
 
-- Existing master aliases (`name`/`track_name`, `artists`/`artist_name`,
-  `album`/`album_name`), year from a valid stored release date, and that date's
-  represented precision. Derived precision describes the stored date's detail;
-  its provenance does not claim Spotify supplied the precision.
-- History CSV files whose names contain `history` or `listening`, under
-  `sensitive_info/`, including the old `artist` column and history copies.
-- Retained audio history JSON under `sensitive_info/history/`. These exports
-  preserve album names that the normalized CSV dropped. Only explicit Spotify
-  track URIs are matched; playback timestamps never become release years.
-  Repeated `trackdone` events can supply labelled duration estimates as described
-  below; skipped/partial playback time is never used as recording duration.
-- Saved version-1 `data/*.spotify-metadata.json` results, including the basic
-  metadata checkpoint. Only supported metadata fields listed in the checkpoint
-  are imported; catalog IDs must already exist in the selected master.
-- Successful Spotify metadata saved in `data/dsp_backlog.csv`. Acquisition retry
-  counters, error state, source files, and cached results are left unchanged.
+### Train a model
 
-Master aliases take priority, followed by agreement among external sources.
-Conflicting nonempty candidates are skipped and reported per column. Existing
-nonmissing master values, acoustic features/provenance, IDs, and row order are
-preserved. No new tracks are inserted and no generic feature cleanup runs.
-Only newly filled metadata cells receive `<field>_metadata_source` provenance.
-The command uses column operations for master aliases and scans each supported
-source once; it does not checkpoint a million local-only rows.
+Open [notebooks/ShuffleRec.ipynb](notebooks/ShuffleRec.ipynb), inspect the settings cell, and run the preparation and training cells. The main controls are `RUN_TRAINING`, `TRAINING_VARIANT`, `RUN_COMPARISON`, and `RUN_FINAL_TEST`. New runs are written under the ignored `sensitive_info/model_runs/` directory without overwriting existing checkpoints.
 
-History `duration_ms` is treated as a confirmed recording duration only when
-the row explicitly identifies polling or a recognized Spotify duration source.
-Other positive history durations may have been estimated by the importer, so
-unambiguous values go into **`history_duration_candidate_ms`**, never silently
-into `duration_ms`. Saved Spotify responses and backlog durations with an explicit
-`duration_ms_source` marker can fill `duration_ms` directly. A row-level Spotify
-source marker is insufficient: API enrichment preserves an older nonmissing
-duration. New backlog API fills now record field-specific duration provenance;
-old unqualified backlog durations remain candidates. A consistent CSV value alone
-does not establish that it was measured by Spotify.
+Use comparison mode to investigate features, then train the selected configuration separately to save an inference checkpoint. Keep final-test evaluation separate from configuration selection.
 
-After confirmed local fills, remaining missing durations can be estimated from
-raw audio JSON records marked `reason_end=trackdone`. The method takes the median
-positive integral `ms_played`, requiring at least **two supporting completed
-plays** and **80% of distinct events within 0.1% of the median**. Events must have
-valid timezone-aware timestamps; track ID plus UTC timestamp deduplicates copies
-across exports. Conflicting copies of the same event are excluded. Partial plays,
-CSV completion percentages, and importer fallback durations do not qualify.
-The thresholds test consistency, not guaranteed accuracy against Spotify.
-
-Accepted estimates fill `duration_ms` only when still missing and record:
-
-- `duration_ms_metadata_source=history_completed_play_median`
-- `duration_ms_is_estimated=True`
-- `duration_ms_estimate_observations`: distinct valid completed-play events
-- `duration_ms_estimate_support`: events within 0.1% of the median
-
-Both `--backfill-local` and `--backfill-backlog-local` use these rules. The summary
-reports how many durations were estimated, including in `--dry-run`. Existing
-durations are never replaced, and estimates remain distinguishable from confirmed
-Spotify values. When filling a missing duration, its estimate flag and evidence
-counts are refreshed together, replacing any orphaned evidence from an older
-value. Once local fills are applied, subsequent API runs skip tracks
-whose requested fields are complete. A job already running keeps its in-memory
-queue until restarted.
-
-To fetch only remaining duration gaps after local backfill:
+### Run offline sequencing
 
 ```powershell
-python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json --dry-run
-python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json
+python -m shufflerec.sequence --checkpoint sensitive_info/model_runs/YOUR_RUN/model.pt --catalog data/master_track_table.csv --playlist sensitive_info/playlist.csv --context sensitive_info/accepted_context.csv --once
 ```
 
-This uses a separate checkpoint because the existing basic checkpoint has a
-different field selection. Requesting `explicit` or other missing fields still
-requires a lookup even when duration has been recovered locally.
+Replace `YOUR_RUN` with a saved run. Playlist and context files need a `track_id` column; context must contain accepted plays in oldest-to-newest order, rather than unfiltered history. Without `--once`, the process accepts JSON commands for a persistent offline session. See [offline sequencing](docs/sequencing.md).
 
-This command works during a Spotify cooldown and never authenticates. It writes
-the master once, atomically, only if cells changed; repeated unchanged runs do not
-rewrite it. A detected concurrent master change aborts the save, but concurrent
-catalog writers remain unsupported. Missing sources are skipped; malformed
-supported source files abort before any master write.
+### Run with Spotify
 
-Use `--master path/to/copy.csv` to select another output catalog. Optional
-`--local-source-root path/to/project` selects a root containing `data/` and
-`sensitive_info/` for source discovery; it defaults to this project. This is
-also how offline tests isolate synthetic sources. Arbitrary datasets, audio
-extraction, and network metadata requests are outside this command.
-
-### Enrich tracks already in the master
-
-`--sync` still adds tracks from listening history that are absent from the master
-catalog. `--backfill` checks **all existing master tracks**, independent of listening
-history, and fills missing metadata only. Both use the same Spotify response mapping
-and the credentials in `sensitive_info/spotify_credentials.json` (`client_id`,
-`client_secret`, `redirect_uri`) and private OAuth cache. Install `pandas` and
-`spotipy` if these are not already installed. Spotify may open its OAuth login flow.
-
-**While audio extraction is running**, fetch into a separate checkpoint:
+Start a playlist in Spotify, then preview the live plan:
 
 ```powershell
-# Preview candidate count; no authentication, API calls, or file writes.
-python scripts/data_merging.py --backfill --dry-run
-
-# Fetch and checkpoint metadata without writing the master CSV or DSP backlog.
-python scripts/data_merging.py --backfill --fetch-only
-
-# AFTER extraction and other catalog writers have stopped:
-python scripts/data_merging.py --apply-backfill --dry-run
-python scripts/data_merging.py --apply-backfill
+python -m shufflerec.live --dry-run --once
 ```
 
-`--fetch-only` queues only tracks that need Spotify lookups after checking existing
-name aliases and release dates. It scans catalog columns using pandas operations,
-then skips local-only fills, invalid Spotify IDs, completed checkpoint entries,
-and known unavailable tracks before entering the fetch loop. The startup report
-separates remaining API lookups from local-only fills. With `--fetch-only`,
-`--limit` counts queued track lookups (individual retries and optional album/artist
-requests can add HTTP calls). Add `--fetch-only` to a dry-run command to preview
-that same API-only queue. Reading the whole catalog once is still necessary.
-Local-only rows are not added to the fetch-only checkpoint; use normal backfill
-when you also want equivalent metadata copied between existing columns.
-
-Add `--recent-first` to prioritize **most recently listened-to tracks**, using
-each queued track's latest `timestamp` in
-`sensitive_info/spotify_listening_history.csv`. This refers to listening recency,
-not release date. Mixed timestamp formats are normalized to UTC; legacy naive
-timestamps are interpreted as UTC. Invalid timestamps are ignored. Ties and
-tracks without usable history retain catalog order, with undated tracks last.
-Only remaining eligible IDs are ranked; `--limit` is applied after ordering.
+This performs authenticated Spotify reads and may refresh the token cache, but does not submit songs or write listening/evidence logs. Once private settings select the intended checkpoint, run continuously with:
 
 ```powershell
-python scripts/data_merging.py --backfill --fetch-only --fields duration_ms --checkpoint data/durations.spotify-metadata.json --recent-first
+python -m shufflerec.live
 ```
 
-Use `--history PATH` with `--recent-first` to select another listening CSV with
-`track_id` and `timestamp` columns. Missing files/columns stop before requests or
-checkpoint writes. Add `--dry-run` to preview eligibility and aggregate history
-coverage without requests or writes. History is read in chunks and only the two
-required columns are loaded. The flag changes request order only: existing
-checkpoints remain compatible, completed/unavailable tracks stay skipped, and
-catalog row order and rate limits are preserved. Without the flag, fetching
-retains catalog order. An already-running process picks up this behavior only
-on a subsequent run.
+Live operation adds tracks to the active device's queue and records playback observations. Credentials, permissions, proxy routing, request budgets, and recovery behavior are covered in the [live pipeline guide](docs/live-pipeline.md).
 
-To prioritize basic metadata while deferring year, popularity, ISRC, and date
-precision, use:
+### Run tests
 
 ```powershell
-python scripts/data_merging.py --backfill --fetch-only --fields track_name artist_name album_name duration_ms explicit --checkpoint data/basic.spotify-metadata.json
-```
-
-Existing checkpoints remain compatible. Local-only records already saved by
-older runs are retained; choose a new checkpoint filename if you prefer a fresh,
-smaller checkpoint (prior fetched results will not be reused by the new file).
-
-For later runs, when no other catalog writer is active, `--backfill` without
-`--fetch-only` fetches and then applies in one command. Applying always reloads
-the latest master CSV and fills only its remaining gaps, preserving extraction
-results, provenance, row order, IDs, existing values, and unrelated columns.
-Atomic replacement protects against interrupted writes, but **does not support
-concurrent master writers**. A running extractor cannot acquire a newly added
-lock, so staging is required during your current extraction run. Run only one
-metadata fetcher per checkpoint at a time.
-
-Default fields are `name`/`track_name`, `artists`/`artist_name`, `artist_ids`,
-`album`/`album_name`, `album_id`, `release_date`, `release_date_precision`, `year`,
-`duration_ms`, `explicit`, `track_number`, `disc_number`, `popularity`, and `isrc`.
-Equivalent existing names and a year derived from `release_date` are used before
-requesting Spotify. `year` describes this album release, which may be a reissue,
-rather than necessarily the original recording's year. Values Spotify omits
-remain missing; false and zero are valid values. Artist IDs/names use comma-separated
-strings, consistent with the existing sync. Existing list-form artist strings are
-preserved. Blank/whitespace cells and numeric NaNs count as missing; existing `-1`
-values are preserved (use the separate placeholder cleanup when appropriate).
-
-Optional album and artist requests can fill `label` and a new `artist_genres`
-JSON list. Album/artist responses are cached within a run. Artist genres are kept
-separate from `genre` and `track_genre` because they describe the artist, not an
-individual track. Stream counts, country, and audio features are outside this
-metadata workflow; they are not inferred or fabricated. Optional fields may be
-unavailable to your Spotify app.
-
-```powershell
-# Smaller resumable runs; repeat the identical command to visit the next entries.
-python scripts/data_merging.py --backfill --fetch-only --limit 100
-
-# Select fields and use a separate checkpoint for this selection.
-python scripts/data_merging.py --backfill --fetch-only --fields artist_name year --checkpoint data/names-and-years.spotify-metadata.json
-
-# Include album label and artist genres in a separate run.
-python scripts/data_merging.py --backfill --fetch-only --extra-metadata --checkpoint data/extended.spotify-metadata.json
-python scripts/data_merging.py --apply-backfill --checkpoint data/extended.spotify-metadata.json
-```
-
-Use `--master path/to/copy.csv` for a separate catalog. Relative paths resolve from
-the current directory; defaults resolve from the project root. The default
-checkpoint is `data/master_track_table.spotify-metadata.json`. It is bound to the
-absolute master path, requested fields, and optional-request setting; mismatched
-options fail rather than silently reuse another run's results. Checkpoints are
-saved every 50 checked tracks and on orderly exit, including Ctrl+C. Completed
-lookups (including omitted fields), unavailable tracks, and invalid/local IDs are
-skipped on resume. Transient failures are retried on subsequent runs; HTTP 429
-stops immediately and persists its cooldown, while other transient request
-errors have bounded retries that each consume HTTP budget.
-Authentication/permission failures stop the run with prior progress saved.
-To revisit completed or unavailable lookups, choose a **new checkpoint filename**.
-Custom checkpoint files can contain your track IDs: keep them private; default
-`data/*.spotify-metadata.json` files are ignored by Git.
-
-Requests use the individual-track endpoint for compatibility with current
-[Spotify development-mode endpoint changes](https://developer.spotify.com/documentation/web-api/references/changes/february-2026).
-This can take substantial time for a large catalog; progress and summary counts
-show fetched, resumed, unavailable, invalid, and failed entries and filled cells
-per column. Relinked Spotify responses retain the requested master ID. Duplicate
-or empty master IDs are rejected before fetching so metadata is never applied to
-ambiguous records. This command deliberately does not run the general feature
-cleaner, modify DSP retry state, or refresh existing popularity values.
-
-## Clear legacy placeholders
-
-Wait for extraction and any other catalog writer to finish. From the repository
-root, preview the number of cells to clear, then apply the cleanup:
-
-```powershell
-python scripts/data_merging.py --clear-placeholders --dry-run
-python scripts/data_merging.py --clear-placeholders
-```
-
-`clear_feature_placeholders(df)` returns a cleaned copy and counts per column.
-`clear_placeholders(master_path=None, dry_run=False)` reads the master CSV and
-applies that function. Use `--master path/to/copy.csv` to select another catalog.
-
-Only exact numeric `-1` values (including strings such as `-1.0`) are cleared
-from known nonnegative fields: the 0–1 audio features, tempo, key, mode, time
-signature, duration, track/disc numbers, year/release_year, popularity, stream
-count, explicit, and the nonnegative `local_*` descriptors. Spotify's `key=-1`
-means no key was detected; it becomes NaN under the project's convention.
-`loudness=-1` and `local_rms_db=-1` are preserved because -1 dB can be a valid
-measurement. Custom columns are left alone rather than guessing their ranges.
-
-NaN is saved as an empty CSV cell. Other values, including zero, other negative
-numbers, text like `NA` and `0007`, row order, duplicate IDs, and provenance are
-preserved. This command does not perform broader repairs or add tracks to the
-backlog. It reports counts per changed column, replaces the CSV atomically, and
-does not rewrite files with no placeholders. `--dry-run` never writes the catalog.
-The existing general cleaner now uses the same placeholder rule, so merge,
-initialization, and repair no longer discard valid -1 dB loudness measurements.
-
-## Tests
-
-```powershell
-python -m pip install pytest
 python -m pytest -q
 ```
 
-Tests use temporary catalogs and generated audio. Online acquisition is simulated
-at the yt-dlp boundary; the default suite makes no network requests and never uses
-private listening data or the real catalog/backlog. In a restricted environment,
-choose a fresh writable `--basetemp` directory under `.test-runs`.
+Tests use synthetic catalogs, temporary files, generated test audio, and simulated service boundaries. They do not need personal listening records or live Spotify access. In restricted environments, use a fresh writable directory under `.test-runs` with `--basetemp`.
+
+## Reproducing the figures
+
+The figures are produced with Matplotlib by [scripts/plot_readme.py](scripts/plot_readme.py). Pipeline and architecture diagrams are written directly in Mermaid Markdown. No image-generation model is used.
+
+```powershell
+python -m pip install -r requirements-docs.txt
+python -m scripts.plot_readme --comparison sensitive_info/model_runs/comparison-20261028T192832Z-85d56b51/comparison_results.json
+```
+
+The explicit comparison path identifies the saved report behind the results table. On another installation, supply the corresponding private report. Omitting `--comparison` regenerates the three dataset figures without a model-comparison figure. No training runs are started.
+
+The script reads the catalog and history without modifying them, streams catalog rows in chunks, and checks input size/modification signatures for changes during collection. It writes figures and an [aggregate snapshot](docs/images/readme_snapshot.json) under `docs/images/`. The exported snapshot contains counts, histogram bins, and selected validation metrics; it excludes track IDs, artist names, listening timestamps, credentials, and private source paths.
+
+Use `--master`, `--history`, and `--output` to select other inputs or an output directory. Generate figures against stable inputs, then update the dataset table and figure discussion if the snapshot changes. Omitting a comparison does not remove an existing comparison image, so keep the results section tied to the intended saved report.
+
+## Current limitations and further work
+
+The data and playback workflow are implemented, along with training, feature comparisons, checkpoint loading, and adaptive sequencing. The model results remain preliminary, and implementation tests are not evidence of recommendation quality in everyday use.
+
+- **Personal scope:** one listener's history cannot establish how the approach generalizes to other users.
+- **Retrospective evaluation:** catalog membership and metadata reflect a supplied snapshot, rather than a fully reconstructed historical catalog.
+- **Sampled ranking:** validation uses small candidate sets; full-catalog evaluation and broader baselines remain useful next steps.
+- **Uneven feature coverage:** local acoustics are available for a limited subset, and recording matching and segment length introduce additional uncertainty.
+- **Experiment depth:** repeated seeds, individual-feature ablations, and a held-out final evaluation are needed before drawing firm conclusions about feature choices.
+- **Live evidence:** Spotify queue constraints, polling gaps, and uncertain playback transitions limit what feedback can establish. Offline tests do not replace a measured live evaluation.
+
+## Detailed guides
+
+This README is the main project overview. The following documents retain the operational detail needed for particular workflows:
+
+| Guide | Contents |
+| --- | --- |
+| [Data pipeline reference](docs/data-pipeline.md) | Metadata recovery, audio matching, extraction options, retries, rate limits, and save recovery |
+| [Model workflow](docs/model-training.md) | Feature contracts, chronological preparation, experiment settings, checkpoint compatibility, and evaluation protocol |
+| [Offline sequencing](docs/sequencing.md) | Candidate pools, JSON commands, feedback, and session limitations |
+| [Live Spotify pipeline](docs/live-pipeline.md) | Private settings, playlist handling, queue commitments, routing, and recovery |
+| [Adaptive playback](docs/adaptive-playback.md) | Polling, conservative evidence, history compatibility, and feedback thresholds |
+| [Model design notes](docs/model-tweaks-design.md) | Background to the feature and training changes |
+| [Historical progress notes](docs/model-tweaks-progress.md) | Earlier implementation snapshots; their counts and status are not current results |
