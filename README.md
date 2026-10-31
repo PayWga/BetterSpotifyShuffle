@@ -11,6 +11,29 @@ history, track metadata and audio features, and a SASRec-inspired Transformer.
 - `notebooks/ShuffleRec.ipynb` prepares sequences and trains next-item and preference models.
 - `scripts/feature_extraction.py` finds audio and fills missing acoustic measurements.
 
+## Live pipeline
+
+Start a playlist on your PC or phone, then run `python -m shufflerec.live` from
+the project root. The pipeline loads the current playlist, runs local inference,
+maintains five upcoming recommendations, and learns from playback observations.
+Use `python -m shufflerec.live --dry-run --once` to preview without queue changes.
+See [the live pipeline guide](docs/live-pipeline.md) for private settings, proxy
+switches, authorization and command recovery.
+
+## Offline sequencing
+
+`python -m shufflerec.sequence --help` starts the local inference/sequencing
+interface. It loads a selected checkpoint once, caches track embeddings, and
+plans adaptive five-song queues without connecting to Spotify. See
+[the sequencing guide](docs/sequencing.md) for file inputs, JSON feedback commands,
+pool configuration, and session-state limitations.
+
+`scripts/polling.py` now uses the shared adaptive playback tracker: 15-second
+checks before acceptance and up to 75 seconds afterward, with conservative queue
+evidence and separate private feedback records. See
+[adaptive playback](docs/adaptive-playback.md) for credential paths, polling
+options, and the submitted-selection interface.
+
 ## Audio feature extraction
 
 Install Python dependencies with `python -m pip install -r requirements-audio.txt`.

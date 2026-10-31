@@ -56,14 +56,29 @@ class SpotifyCooldown(SpotifyBudgetBlocked):
 
 
 class BudgetedAdapter(requests.adapters.HTTPAdapter):
-    def __init__(self, budget):
+    def __init__(self, budget, *, proxy_enabled=False):
         super().__init__(max_retries=Retry(total=0, raise_on_status=False))
         self.budget = budget
+        self.proxy_enabled = proxy_enabled
 
     def send(self, request, **kwargs):
         if self.budget is not None:
             self.budget.reserve()
-        response = super().send(request, **kwargs)
+        failed = False
+        try:
+            response = super().send(request, **kwargs)
+        except RequestException:
+            if not self.proxy_enabled:
+                raise
+            failed = True
+        if failed:
+            # Raise outside the except block: neither exception text nor an
+            # attached original traceback may retain authenticated proxy URLs.
+            try:
+                from .spotify_proxy import SpotifyProxyError
+            except ImportError:
+                from spotify_proxy import SpotifyProxyError
+            raise SpotifyProxyError('Spotify proxy connection failed; direct fallback is disabled')
         if response.status_code == 429 and self.budget is not None:
             delay = retry_delay(response.headers)
             seconds = 86400 if delay is None else delay + 60
@@ -94,10 +109,19 @@ class BudgetedAdapter(requests.adapters.HTTPAdapter):
         return response
 
 
-def metadata_session(budget=None):
+def metadata_session(budget=None, *, use_proxy=None, proxy_config_path=None):
     """Return 429 responses intact instead of urllib3's headerless RetryError."""
     session = requests.Session()
-    adapter = BudgetedAdapter(budget)
+    try:
+        try:
+            from .spotify_proxy import configure_session
+        except ImportError:
+            from spotify_proxy import configure_session
+        configure_session(session, config_path=proxy_config_path, use_proxy=use_proxy)
+    except Exception:
+        session.close()
+        raise
+    adapter = BudgetedAdapter(budget, proxy_enabled=session.spotify_proxy_enabled)
     session.mount('https://', adapter)
     session.mount('http://', adapter)
     return session
