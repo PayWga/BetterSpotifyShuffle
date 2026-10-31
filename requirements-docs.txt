@@ -1,0 +1,3 @@
+# README figures; model dependencies supply pandas and NumPy.
+-r requirements-model.txt
+matplotlib>=3.9,<4
