@@ -103,8 +103,12 @@ can be ambiguous for short songs. Once accepted, an occurrence cannot receive a
 later rejection. Pending duplicate track IDs do not establish occurrence identity;
 consumed occurrences are retired so later legitimate repeats remain identifiable.
 
-The legacy `spotify_listening_history.csv` schema and historical 70% PLAY / below
-15% GHOST_SKIP rules are preserved. Only observed occurrences with measured
+The required `spotify_listening_history.csv` fields and historical 70% PLAY /
+below 15% GHOST_SKIP rules are preserved. Existing 15-column files remain valid;
+new files also include duration source and estimate-status columns. Imported
+optional fields are retained, and live rows follow the existing header order.
+Missing or duplicate required columns are rejected before appending.
+Only observed occurrences with measured
 listening are written there. A transition whose upper bound cannot establish a
 historical early skip uses `reason_end=uncertain_transition`, so unknown elapsed
 listening cannot become a GHOST_SKIP. Fully inferred tracks are not fabricated as
@@ -112,6 +116,17 @@ zero-duration history rows. New evidence is written separately to private
 `sensitive_info/playback_evidence.jsonl`, with UTC timestamps and fields including
 `selection_id`, `inferred`, `weak`, `weight`, `gap_ms`, and `upper_bound_ms`.
 Occurrence/selection IDs are local to a process, not globally persistent IDs.
+
+History import keeps estimated duration provenance and leaves unknown durations
+missing. Estimated durations do not create completion-based PLAY/GHOST_SKIP
+labels; an explicit `trackdone` reason still establishes a completed play.
+Existing labels are retained during normalization. Legacy rows without estimate
+provenance cannot be retrospectively identified as estimates by this change.
+
+Pool feedback and model-training labels have different roles. Live pool
+acceptance defaults to 25%; model training still reads the historical PLAY and
+GHOST_SKIP labels. Weighted playback evidence is kept separately and is not
+automatically used for model training.
 
 ## Sequencer coordination
 

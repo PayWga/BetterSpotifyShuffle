@@ -107,7 +107,7 @@ def test_inference_to_five_queue_additions_then_skip_feedback_and_refill(tmp_pat
     assert len(set(sp.queued)) == 5 and '0' not in sp.queued
     before_reads = sp.reads
     app.step()
-    assert sp.reads == before_reads  # background wakeups do not poll Spotify again
+    assert sp.reads == before_reads  # Background wakeups leave the playback read count unchanged.
     sp.advance_to(2)
     clock.advance()
     events = app.step()

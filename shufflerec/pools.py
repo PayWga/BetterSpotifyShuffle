@@ -102,8 +102,8 @@ class PoolPolicy:
         active = [i for i, name in enumerate(POOL_NAMES) if name in available]
         fixed = {}
         while active:
-            # Subtract common fatigue BEFORE multiplying; at least one logit is
-            # finite even when another pool's temporary penalty overflows.
+            # Subtract shared fatigue before applying its strength.
+            # This keeps at least one logit finite if another penalty overflows.
             baseline = min(fatigue[i] for i in active)
             logs = {i: self._log_base_weights[i] + self.preferences[i]
                     - c.fatigue_strength * (fatigue[i] - baseline) for i in active}
@@ -112,8 +112,8 @@ class PoolPolicy:
             remaining = 1 - sum(fixed.values())
             total = sum(weights.values())
             proposed = {i: remaining * value / total for i, value in weights.items()}
-            # Resolve upper bounds first: capping a dominant pool redistributes
-            # mass and can lift apparently tiny pools above the lower bound.
+            # Cap oversized probabilities first. Redistributing their weight can
+            # bring smaller pools above the lower bound without another adjustment.
             over = [i for i in active if proposed[i] > c.max_probability]
             under = [i for i in active if proposed[i] < c.min_probability]
             clamped = over or under

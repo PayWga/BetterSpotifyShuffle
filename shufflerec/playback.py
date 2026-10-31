@@ -118,7 +118,7 @@ class PlaybackTracker:
         if self.active and self.active.selection_id is not None:
             self._index = next((i for i, t in enumerate(tracks) if t.selection_id == self.active.selection_id), None)
         elif self.active and follows_active:
-            self._index = -1  # verified first upcoming item follows external active playback
+            self._index = -1  # Confirmed queue starts after the external current track.
 
     def interrupt(self):
         """An outage is not a pause, listen, skip, or proof of queue continuity."""
@@ -206,11 +206,11 @@ class PlaybackTracker:
                                               weak=weak, gap=gap, upper=gap, reason='queue_progression'))
                     self._consumed.add(submitted.selection_id)
             elif not replay and not (continuity and self._order_valid and next_index is not None):
-                # Identifying the next acknowledged item does not require an
-                # acknowledged predecessor (e.g. initial external playback).
+                # The next submitted track can still be identified when the previous
+                # track was external, as long as its queue position is confirmed.
                 self._order_valid = False
         if self.active is None:
-            # Ambiguous repeated track IDs never identify a submitted occurrence.
+            # Repeated track IDs need a unique match before attaching a submission.
             identity = self.submitted[next_index].selection_id if next_index is not None and self._order_valid and not replay else None
             self.active = self._new(snapshot.track_id, snapshot.duration_ms, identity, snapshot.progress_ms)
             self._index = next_index if identity is not None else None
@@ -226,8 +226,8 @@ class PlaybackTracker:
                 item.upper_bound_ms = item.duration_ms or float('inf')
                 self._order_valid = False
             else:
-                # Pause/resume endpoints don't locate the change within the gap.
-                # Count no measured listening, but retain the maximum possible.
+                # The pause or resume could have happened anywhere in this gap.
+                # Keep the possible listening time without counting it as measured.
                 item.upper_bound_ms += gap
             if item.duration_ms:
                 item.listened_ms = min(item.listened_ms, item.duration_ms)
@@ -248,6 +248,6 @@ class PlaybackTracker:
             remaining = max(0., (snapshot.duration_ms - snapshot.progress_ms) / 1000)
             if remaining > self.config.end_guard_seconds:
                 remaining -= self.config.end_guard_seconds
-            # Avoid a busy loop when a player lingers at its reported end position.
+            # Use a short retry when playback lingers at the end, avoiding a busy loop.
             return min(interval, remaining) if remaining > 0 else min(interval, 1.)
         return min(interval, self.config.early_poll_seconds)

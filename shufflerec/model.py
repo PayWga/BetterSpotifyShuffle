@@ -35,7 +35,7 @@ class TrackEncoder(nn.Module):
                                          for name, vocab in preprocessor.vocabularies.items()})
         for embedding in self.embeddings.values():
             with torch.no_grad():
-                # Unknown identities have no randomly invented preference.
+                # Start unknown identities at zero instead of a random embedding.
                 embedding.weight[1].zero_()
         width = self.numeric_size * 2 + sum(e.embedding_dim + 1 for e in self.embeddings.values())
         self.projection = nn.Linear(width, config.d_model)
@@ -77,8 +77,8 @@ class SpotifySASRec(nn.Module):
         x = x + self.pos_emb(torch.arange(length, device=x.device))
         causal = torch.ones(length, length, dtype=torch.bool, device=x.device).tril()
         allowed = causal.unsqueeze(0) & ~padding_mask.unsqueeze(1)
-        # Padded query rows otherwise have no legal keys. Give them a self edge;
-        # real queries still cannot attend to any padding or future positions.
+        # Let padded queries attend to themselves so no attention row is empty.
+        # Real queries still cannot see padding or future positions.
         identity = torch.eye(length, dtype=torch.bool, device=x.device)
         allowed |= padding_mask.unsqueeze(-1) & identity.unsqueeze(0)
         mask = (~allowed).repeat_interleave(self.config.nhead, dim=0)

@@ -87,7 +87,8 @@ def main(argv=None):
         config = SequencerConfig(**options)
         playlist = read_ids(args.playlist)
         context = read_ids(args.context) if args.context else []
-        # Cache only playlist/context rows, not an unrelated full master catalog.
+        # Load only playlist and context tracks into the embedding cache.
+        # The rest of the master catalog is not needed for this session.
         catalog = read_catalog(args.catalog, track_ids=set(playlist) | set(context))
         engine = InferenceEngine.from_checkpoint(args.checkpoint, catalog,
                                                   device=args.device, batch_size=args.batch_size)
@@ -109,7 +110,7 @@ def main(argv=None):
             event, data = handle_request(seq, request, session=session)
             emit(event, **data)
         except (ValueError, TypeError) as exc:
-            # Parsing errors must not echo input lines, which can contain private IDs.
+            # Input lines can contain private IDs, so parsing errors leave them out.
             message = 'Invalid JSON request' if isinstance(exc, json.JSONDecodeError) else str(exc)
             emit('error', message=message)
     return 0

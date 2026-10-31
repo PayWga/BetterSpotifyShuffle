@@ -11,6 +11,29 @@ history, track metadata and audio features, and a SASRec-inspired Transformer.
 - `notebooks/ShuffleRec.ipynb` prepares sequences and trains next-item and preference models.
 - `scripts/feature_extraction.py` finds audio and fills missing acoustic measurements.
 
+## Environment setup
+
+Use one Python environment for the notebook kernel and the command-line tools.
+Install the dependency sets needed for each workflow:
+
+| Workflow | Requirement files |
+| --- | --- |
+| Model training and offline sequencing | `requirements-model.txt` |
+| Spotify playback and live sequencing | `requirements-model.txt` and `requirements-spotify.txt` |
+| Audio acquisition and extraction | `requirements-audio.txt` |
+| All workflows and tests | All three files |
+
+```powershell
+python -m pip install -r requirements-model.txt -r requirements-spotify.txt -r requirements-audio.txt
+python -m pytest -q
+```
+
+Audio extraction also needs FFmpeg and ffprobe on PATH. YouTube acquisition uses
+Node.js or Deno as described below. The requirement files allow compatible
+version ranges; they do not lock an exact environment. An environment snapshot
+can be kept beside private model artifacts with
+`python -m pip freeze > sensitive_info/model_runs/YOUR_RUN/environment.txt`.
+
 ## Live pipeline
 
 Start a playlist on your PC or phone, then run `python -m shufflerec.live` from
@@ -95,6 +118,14 @@ in either mode; download quality and source selection are unchanged.
 Each candidate downloads into a separate staging directory. Failed staging files
 are retained for inspection; only successful WAV conversions and their source
 sidecars are published into the cache root.
+Publication uses a per-track `.publication.json` marker. A pending or invalid
+marker blocks cache reuse until both the WAV and sidecar have been published and
+their signatures committed. A failed publication retains staged files and any
+previous cache backup; an online rerun can publish a fresh pair. Keep these
+markers with their recordings. Older unmarked local caches remain supported.
+This protects the application's cache reads after interrupted replacements;
+it does not coordinate concurrent cache writers or guarantee recovery from
+power loss.
 
 Matching tolerates apostrophe variations, `feat`/`ft` credits, equivalent
 `remaster`/`remastered` wording, comma/semicolon-separated artist credits, and
@@ -281,8 +312,9 @@ the feature definitions and key-estimation algorithm are unchanged.
 
 The extractor deliberately preserves existing `-1` values because they are
 nonmissing CSV values. Use the placeholder cleanup below to normalize known
-unknown values to NaN before extraction. The notebook still needs explicit model
-availability/sequence masks and does not yet consume `local_*` features.
+unknown values to NaN before extraction. The notebook uses feature availability
+masks separately from sequence padding and supports individual `local_*` inputs.
+See [the model workflow](docs/model-training.md) for feature controls and evaluation.
 
 ## Fill missing Spotify metadata
 

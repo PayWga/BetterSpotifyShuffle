@@ -29,6 +29,8 @@ class EngineProvider:
         self.checkpoint, self.master, self.cache = checkpoint, master, cache
         self.device, self.batch_size, self.clock = device, batch_size, clock
         self._model = self._preprocessor = self._master = None
+        self._engine = None
+        self._engine_weights = None
 
     def __call__(self, source, playback, context):
         return self.load(source, playback, context)
@@ -70,8 +72,18 @@ class EngineProvider:
                     frame.at[identity, name] = value
         frame['id'] = frame.index
         check_cancelled()
-        engine = InferenceEngine(self._model, self._preprocessor, frame.reset_index(drop=True),
-                                 batch_size=self.batch_size)
+        frame = clean_catalog(frame.reset_index(drop=True))
+        weights = tuple((id(value), value._version, value.device, value.dtype)
+                        for value in self._model.parameters())
+        # Keep only the latest engine. A playlist version change alone does not
+        # change embeddings when its resolved rows and model weights are identical.
+        if (self._engine is None or self._engine_weights != weights
+                or not self._engine.catalog.equals(frame)):
+            engine = InferenceEngine(self._model, self._preprocessor, frame,
+                                     batch_size=self.batch_size)
+            check_cancelled()
+            self._engine, self._engine_weights = engine, weights
+        engine = self._engine
         return SourceBundle(source, playlist.version, playlist.track_ids, engine)
 
 

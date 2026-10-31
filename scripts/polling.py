@@ -10,6 +10,8 @@ if __package__ in (None, ''):
     sys.path.insert(0, str(PROJECT_ROOT))
 PRIVATE_DIR = PROJECT_ROOT / "sensitive_info"
 
+from scripts.history_schema import NEW_FILE_COLUMNS, REQUIRED_COLUMNS, read_header
+
 CSV_FILE = PRIVATE_DIR / "spotify_listening_history.csv"
 CREDS_PATH = PRIVATE_DIR / "spotify_credentials.json"
 CACHE_PATH = PRIVATE_DIR / ".spotify_cache"
@@ -27,23 +29,7 @@ PLAY_THRESHOLD = 0.70
 SKIP_THRESHOLD = 0.15
 
 
-CSV_COLUMNS = [
-    "timestamp",
-    "track_id",
-    "track_name",
-    "artist_name",
-    "ms_played",
-    "duration_ms",
-    "completion_rate",
-    "reason_start",
-    "reason_end",
-    "event_type",
-    "is_play",
-    "is_ghost_skip",
-    "context_uri",
-    "context_type",
-    "event_source"
-]
+CSV_COLUMNS = list(REQUIRED_COLUMNS)
 
 
 def get_spotify_client(*, use_proxy=None):
@@ -61,19 +47,11 @@ def init_csv(*, csv_path=None):
     path.parent.mkdir(parents=True, exist_ok=True)
 
     if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            existing_header = next(csv.reader(f), [])
-
-        if existing_header != CSV_COLUMNS:
-            raise ValueError(
-                "Existing listening history has a different schema. "
-                "Migrate or normalize it before starting the daemon."
-            )
-
+        read_header(path)
         return
 
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
+        writer = csv.DictWriter(f, fieldnames=NEW_FILE_COLUMNS)
         writer.writeheader()
 
 
@@ -127,12 +105,19 @@ def log_track(track_data, listened_ms, context_uri, context_type, reason_end, *,
         "is_ghost_skip": is_ghost_skip,
         "context_uri": context_uri,
         "context_type": context_type,
-        "event_source": "live_polling"
+        "event_source": "live_polling",
+        "duration_ms_is_estimated": False if duration_ms is not None else None,
+        "duration_ms_source": 'spotify_polling' if duration_ms is not None else None,
     }
 
-    with open(csv_path if csv_path is not None else CSV_FILE, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=CSV_COLUMNS)
-        writer.writerow(record)
+    path = Path(csv_path) if csv_path is not None else CSV_FILE
+    init_csv(csv_path=path)
+    columns = read_header(path)
+    with path.open('a', newline='', encoding='utf-8') as f:
+        # Imported history can carry extra fields in a different order.
+        # Write against its header so new rows keep every column aligned.
+        writer = csv.DictWriter(f, fieldnames=columns)
+        writer.writerow({name: record.get(name) for name in columns})
 
     completion_text = f'{completion_rate:.1%}' if completion_rate is not None else 'unknown'
     if quiet:

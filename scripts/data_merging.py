@@ -18,7 +18,7 @@ else:
     import spotify_metadata
     import local_backfill
 
-# Paths: assumes this file is in the project's scripts/ directory.
+# Resolve shared paths from the scripts directory, regardless of the working directory.
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 DATA_DIR = PROJECT_ROOT / "data"
@@ -31,9 +31,9 @@ HISTORY_DB = PRIVATE_DIR / "spotify_listening_history.csv"
 SCOPE = "user-read-private"
 
 
-# --- Audio features ---
+# Audio features
 
-# Continuous audio characteristics
+# Continuous audio measurements.
 CONTINUOUS_FEATURES = [
     "danceability",
     "energy",
@@ -46,14 +46,19 @@ CONTINUOUS_FEATURES = [
     "tempo"
 ]
 
-# Discrete audio characteristics
+# Discrete audio measurements.
 DISCRETE_FEATURES = [
     "key",
     "mode",
     "time_signature"
 ]
 
-# Audio features expected to be between 0 and 1
+LOCAL_NUMERICAL_FEATURES = (
+    'local_rms_db', 'local_onset_strength', 'local_spectral_centroid',
+    'local_spectral_contrast', 'local_beat_regularity',
+)
+
+# These audio features use a 0-1 range.
 BOUNDED_FEATURES = [
     "danceability",
     "energy",
@@ -65,7 +70,7 @@ BOUNDED_FEATURES = [
 ]
 
 
-# --- Additional numerical features ---
+# Additional numeric features
 
 NUMERICAL_FEATURES = [
     "duration_ms",
@@ -76,13 +81,13 @@ NUMERICAL_FEATURES = [
     "stream_count"
 ]
 
-# --- Boolean features ---
+# Boolean features
 
 BOOLEAN_FEATURES = [
     "explicit"
 ]
 
-# --- Categorical features ---
+# Categorical features
 
 CATEGORICAL_FEATURES = [
     "album_id",
@@ -93,7 +98,7 @@ CATEGORICAL_FEATURES = [
     "label"
 ]
 
-# --- Track identity and descriptive metadata ---
+# Track identity and descriptive metadata
 
 METADATA_COLUMNS = [
     "id",
@@ -107,10 +112,9 @@ METADATA_COLUMNS = [
 ]
 
 
-# A measured -1 is impossible in these known nonnegative fields. For key,
-# Spotify's -1 means "no key detected", normalized to this project's NaN.
-# Loudness and local_rms_db are deliberately excluded: -1 dB can be real.
-# Unknown/custom columns and provenance are never interpreted as placeholders.
+# Treat -1 as missing only in known nonnegative fields, including unknown key.
+# Signed dB measurements can be valid at -1 and stay unchanged.
+# Custom columns and provenance are left alone.
 PLACEHOLDER_COLUMNS = (
     BOUNDED_FEATURES + ["tempo"] + DISCRETE_FEATURES
     + NUMERICAL_FEATURES + BOOLEAN_FEATURES
@@ -145,7 +149,7 @@ def clear_placeholders(master_path=None, dry_run=False):
     Returns counts of changed cells per column; an unchanged file is not rewritten.
     """
     path = Path(MASTER_DB if master_path is None else master_path)
-    # Read text verbatim so labels like 0007 and names like NA survive the rewrite.
+    # Read values as text to preserve leading zeros and names like NA.
     df = pd.read_csv(path, dtype="string", keep_default_na=False, low_memory=False)
     if "id" not in df.columns:
         raise ValueError("Master CSV must have an id column")
@@ -161,6 +165,23 @@ def clear_placeholders(master_path=None, dry_run=False):
 
 
 
+def read_track_csv(path):
+    """Load catalog text without guessing metadata types or missing labels."""
+    frame = pd.read_csv(path, dtype='string', keep_default_na=False,
+                        na_values=[''], low_memory=False)
+    numeric = set(CONTINUOUS_FEATURES + DISCRETE_FEATURES + NUMERICAL_FEATURES)
+    numeric.update(LOCAL_NUMERICAL_FEATURES)
+    numeric.update(('release_year', 'history_duration_candidate_ms',
+                    'duration_ms_estimate_observations', 'duration_ms_estimate_support'))
+    numeric.update(name + '_analysis_seconds'
+                   for name in ('tempo', 'key', 'mode') + LOCAL_NUMERICAL_FEATURES)
+    # Textual NaNs represent gaps in known numeric fields. Metadata labels
+    # and valid numeric text keep their original representation.
+    for name in numeric.intersection(frame.columns):
+        frame[name] = frame[name].mask(frame[name].str.strip().str.casefold().eq('nan'))
+    return frame
+
+
 def normalize_track_ids(df):
     """Normalize the track ID column to 'id'."""
 
@@ -173,7 +194,7 @@ def normalize_track_ids(df):
             raise ValueError("Dataset must contain 'id' or 'track_id'.")
 
     elif "track_id" in df.columns:
-        # If both columns exist, check that they don't disagree.
+        # Both ID columns can be present, but their nonmissing values must agree.
         left = df["id"].astype("string").str.strip()
         right = df["track_id"].astype("string").str.strip()
 
@@ -206,14 +227,14 @@ def clean_track_features(df):
     audio_features = CONTINUOUS_FEATURES + DISCRETE_FEATURES
     numeric_columns = audio_features + NUMERICAL_FEATURES
 
-    # Convert numerical columns to numeric types
+    # Convert known numeric columns before checking their ranges.
     for col in numeric_columns:
         if col not in df.columns:
             continue
 
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Validate audio features bounded between 0 and 1
+    # Out-of-range values in bounded audio features become missing.
     for col in BOUNDED_FEATURES:
         if col in df.columns:
             invalid = (
@@ -222,12 +243,11 @@ def clean_track_features(df):
             )
             df.loc[invalid, col] = float("nan")
 
-    # Tempo must not be negative.
-    # Zero is retained as a possible no-beat estimate.
+    # Negative tempo is invalid. Zero stays as a possible no-beat estimate.
     if "tempo" in df.columns:
         df.loc[df["tempo"] < 0, "tempo"] = float("nan")
 
-    # Musical key: C=0, C#=1, ..., B=11
+    # Keys run from C=0 through B=11; other values become missing.
     if "key" in df.columns:
         invalid = (
             df["key"].notna()
@@ -235,7 +255,7 @@ def clean_track_features(df):
         )
         df.loc[invalid, "key"] = float("nan")
 
-    # Musical mode: minor=0, major=1
+    # Mode uses minor=0 and major=1.
     if "mode" in df.columns:
         invalid = (
             df["mode"].notna()
@@ -243,7 +263,7 @@ def clean_track_features(df):
         )
         df.loc[invalid, "mode"] = float("nan")
 
-    # Time signature must be a positive integer
+    # Time signatures need a positive whole-number value.
     if "time_signature" in df.columns:
         values = df["time_signature"]
         invalid = (
@@ -252,7 +272,7 @@ def clean_track_features(df):
         )
         df.loc[invalid, "time_signature"] = float("nan")
 
-    # Nonnegative numerical metadata
+    # Negative values are invalid for these numeric metadata fields.
     nonnegative_features = [
         "duration_ms",
         "track_number",
@@ -264,8 +284,7 @@ def clean_track_features(df):
         if col in df.columns:
             df.loc[df[col] < 0, col] = float("nan")
 
-    # Track popularity, when represented on Spotify's
-    # historical 0–100 scale
+    # Popularity uses Spotify's historical 0-100 scale.
     if "popularity" in df.columns:
         invalid = (
             df["popularity"].notna()
@@ -273,7 +292,7 @@ def clean_track_features(df):
         )
         df.loc[invalid, "popularity"] = float("nan")
 
-    # Validate release year conservatively
+    # Keep whole release years within a broad, fixed range.
     if "year" in df.columns:
         invalid = (
             df["year"].notna()
@@ -309,8 +328,7 @@ def merge_track_data(master_df, new_df):
     master_df = master_df.set_index("id")
     new_df = new_df.set_index("id")
 
-    # Existing valid values take priority.
-    # Incoming values fill missing fields.
+    # Existing valid values take priority; incoming records only fill gaps.
     combined_df = master_df.combine_first(new_df)
 
     return combined_df.reset_index()
@@ -422,7 +440,7 @@ def init_database():
         return
 
     print("Loading baseline dataset...")
-    tracks_db = pd.read_csv(BASE_DATASET, low_memory=False)
+    tracks_db = read_track_csv(BASE_DATASET)
 
     tracks_db = normalize_track_ids(tracks_db)
     tracks_db = clean_track_features(tracks_db)
@@ -457,8 +475,8 @@ def merge_csv(new_csv_filename):
         print(f"Error: File not found: {target_path}")
         return
 
-    master_df = pd.read_csv(MASTER_DB, low_memory=False)
-    new_df = pd.read_csv(target_path, low_memory=False)
+    master_df = read_track_csv(MASTER_DB)
+    new_df = read_track_csv(target_path)
 
     initial_count = len(normalize_track_ids(master_df)["id"].unique())
 
@@ -498,7 +516,7 @@ def sync_metadata():
 
     def save_records():
         if records:
-            # Reload before filling gaps to preserve updates made during fetching.
+            # Reload before filling gaps so updates made during fetching are preserved.
             current = spotify_metadata.read_catalog(MASTER_DB)
             spotify_metadata.fill_records(current, records, spotify_metadata.TRACK_FIELDS, allow_new=True)
             save_database(current.reset_index())
@@ -535,7 +553,7 @@ def repair_database():
         print("Error: Master database not found.")
         return
 
-    df = pd.read_csv(MASTER_DB, low_memory=False)
+    df = read_track_csv(MASTER_DB)
 
     initial_count = len(df)
 
@@ -639,10 +657,10 @@ if __name__ == "__main__":
         clear_placeholders(args.master, args.dry_run)
     else:
         print("Please specify an action. Usage examples:")
-        print("  python.exe data_manager.py --init")
-        print("  python.exe data_manager.py --merge workout_songs.csv")
-        print("  python data_manager.py --sync")
-        print("  python data_manager.py --repair")
+        print("  python scripts/data_merging.py --init")
+        print("  python scripts/data_merging.py --merge workout_songs.csv")
+        print("  python scripts/data_merging.py --sync")
+        print("  python scripts/data_merging.py --repair")
         print("  python scripts/data_merging.py --clear-placeholders --dry-run")
         print("  python scripts/data_merging.py --backfill --fetch-only")
         print("  python scripts/data_merging.py --apply-backfill")

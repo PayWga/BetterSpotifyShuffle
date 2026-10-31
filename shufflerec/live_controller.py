@@ -419,7 +419,7 @@ class LiveController:
             self._record(events, self._raw)
             self._last = snapshot
             if self.session and self._queue_valid and self.session.submitted:
-                # Re-anchor an external current track only after it was observed.
+                # Confirm the external current track before anchoring the submitted queue to it.
                 self._anchored = self._prefix(self._queue.track_ids, self.session.submitted)
                 self.session.confirm_order(follows_active=self._anchored)
             self._next_poll = min(self._next_poll if self._needs_queue else float('inf'),

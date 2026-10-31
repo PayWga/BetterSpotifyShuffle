@@ -44,8 +44,8 @@ class FeatureConfig:
 
     @property
     def enabled_local_features(self):
-        # Keep the old aggregate gate for saved configurations and callers;
-        # each measurement now also has its own independent switch.
+        # The shared switch keeps older configs working.
+        # Individual switches control which local measurements are included.
         return tuple(name for name in LOCAL if self.local and getattr(self, name))
 
     def __post_init__(self):
@@ -145,8 +145,8 @@ class FeaturePreprocessor:
                 candidate = pd.to_numeric(series(frame, name), errors='coerce')
                 candidate = candidate.where(candidate.between(1850, 2100) & candidate.mod(1).eq(0))
                 fallback = fallback.fillna(candidate)
-            # Spotify supports year/month/day precision. Numeric YYYY values
-            # inferred by CSV readers are calendar years, never epoch nanoseconds.
+            # Release dates can contain a year, month, or full date.
+            # Numeric years from CSV loading need to stay years, not epoch timestamps.
             text = series(frame, 'release_date').astype('string').str.strip()
             text = text.str.replace(r'^(\d{4})\.0+$', r'\1', regex=True)
             text = text.where(text.str.fullmatch(r'\d{4}(?:-\d{2}(?:-\d{2})?)?', na=False))
@@ -158,7 +158,7 @@ class FeaturePreprocessor:
                 continue
             v = values[name]
             if name == 'local_rms_db':
-                continue  # negative dB, including -1, are real measurements
+                continue  # Negative dB values, including -1, can be valid measurements.
             valid = v > 0 if name in ('duration_ms', 'time_signature') else v >= 0
             if name in ('popularity', 'local_beat_regularity'):
                 valid &= v <= (100 if name == 'popularity' else 1)
@@ -171,8 +171,8 @@ class FeaturePreprocessor:
             if self.duration_policy == 'exclude_estimated':
                 values['duration_ms'] = values['duration_ms'].mask(estimated.eq(1))
             elif self.duration_policy == 'include_estimated':
-                # Unknown source status remains missing; unflagged never means
-                # independently verified. Invalid/missing duration stays missing.
+                # A missing estimate flag does not confirm the duration's source.
+                # Keep that uncertainty, and leave invalid durations missing.
                 values['duration_ms_is_estimated'] = estimated.where(values['duration_ms'].notna())
         if self.config.provenance:
             for name in EXTRACTED[:3] + self.config.enabled_local_features:
@@ -194,7 +194,7 @@ class FeaturePreprocessor:
     def _artist_records(self, frame):
         names = first_present(frame, ['artists', 'artist_name'])
         ids = series(frame, 'artist_ids')
-        # IDs are case-sensitive: normalize whitespace, never case-fold them.
+        # IDs are case-sensitive. Trim whitespace without changing their case.
         records = []
         for raw_names, raw_ids in zip(names, ids):
             labels = parse_labels(raw_names)
@@ -223,7 +223,7 @@ class FeaturePreprocessor:
         if self.config.artist_genre:
             result['artist_genre'] = [parse_labels(v) for v in series(frame, 'artist_genres')]
         if self.config.album:
-            # Album titles alone are ambiguous across artists; require a stable ID.
+            # Album titles can repeat across artists, so matching needs a stable ID.
             result['album'] = [[str(v).strip()] if pd.notna(v) and str(v).strip() else []
                                for v in series(frame, 'album_id')]
         if self.config.time_signature_encoding == 'categorical':
@@ -268,7 +268,8 @@ class FeaturePreprocessor:
                 lo, hi = self.scales[name]
                 values[name] = ((values[name] - lo) / (hi - lo if hi > lo else 1)).clip(0, 1)
             elif name not in fixed and not name.endswith('_is_local'):
-                # No training observations: do not introduce uncalibrated magnitudes.
+                # This feature had no training values to establish a scale.
+                # Keep it masked instead of passing through an unscaled value.
                 values[name] = np.nan
                 mask[:, self.numeric_names.index(name)] = 0
         result = {'numeric': values.fillna(0).to_numpy(dtype=np.float32), 'numeric_mask': mask}

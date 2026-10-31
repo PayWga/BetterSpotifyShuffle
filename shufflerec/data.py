@@ -71,7 +71,8 @@ def extract_examples(sessions, usable_ids, max_length=10):
                 pending = []
                 context = (context + [track])[-max_length:]
             else:
-                # Preserve the old event semantics; new history signals are deferred.
+                # Events other than PLAY and GHOST_SKIP reset the context.
+                # Other history signals are not used for training here.
                 context, pending = [], []
     return nip, pairs
 

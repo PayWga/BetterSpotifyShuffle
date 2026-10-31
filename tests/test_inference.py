@@ -65,7 +65,7 @@ def test_cache_batches_candidates_and_does_not_encode_them_again():
     first = engine.rank(['a'], ['b', 'c'])
     second = engine.rank(['a'], ['b', 'c'])
     assert first == second
-    assert sizes == [(1, 3, 8), (1, 3, 8)]  # context encoding only
+    assert sizes == [(1, 3, 8), (1, 3, 8)]  # Only context is encoded; candidate vectors are already cached.
     handle.remove()
 
 

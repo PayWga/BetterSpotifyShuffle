@@ -55,8 +55,8 @@ class SpotifyQueueGateway:
         if not isinstance(response.get('queue'), list):
             raise ValueError('Spotify returned an invalid queue snapshot')
         current = response.get('currently_playing') or {}
-        # Keep unknown/episode positions: dropping them could create a false
-        # matching prefix and invent continuity through a manual queue entry.
+        # Keep unknown items and episodes in their queue positions.
+        # Dropping them could make unrelated queue entries look like a match.
         ids = tuple(item.get('id') if isinstance(item, dict) and item.get('type', 'track') == 'track'
                     else None for item in response['queue'])
         return QueueSnapshot(current.get('id'), ids)

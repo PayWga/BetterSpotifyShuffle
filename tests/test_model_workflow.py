@@ -65,7 +65,7 @@ def test_notebook_runs_synthetic_training_and_checkpoint_without_source_writes(t
     notebook=json.loads(Path('notebooks/ShuffleRec.ipynb').read_text(encoding='utf-8'))
     assert any('RUN_TRAINING' in ''.join(c.get('source',[])) for c in notebook['cells']), 'notebook is not integrated'
     project=tmp_path/'project';(project/'data').mkdir(parents=True);(project/'sensitive_info').mkdir()
-    (project/'shufflerec').mkdir()  # root detection; imports use real project on sys.path
+    (project/'shufflerec').mkdir()  # Enable root detection; imports still use the real project on sys.path.
     catalog=pd.DataFrame([dict(id=t,tempo=100+i*10,artists=t) for i,t in enumerate('abcd')])
     history=pd.DataFrame([dict(track_id=t,event_type='PLAY' if t!='d' else 'NEUTRAL',timestamp=f'2020-01-{day:02d}T00:0{i}:00Z')
                           for day in range(1,11) for i,t in enumerate('abcd')])

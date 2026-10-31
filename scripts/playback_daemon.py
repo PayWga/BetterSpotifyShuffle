@@ -55,9 +55,9 @@ class PlaybackRecorder:
                     track, source = record
                     reason = event.reason
                     duration = track.get('duration_ms')
-                    # A measured lower bound of zero isn't proof of an early
-                    # skip. Preserve legacy classification without mislabelling
-                    # outages, transfers, or uncertain timing as GHOST_SKIP.
+                    # Zero measured listening alone does not prove an early skip.
+                    # Outages, device changes, and uncertain timing need to stay
+                    # out of the historical GHOST_SKIP label.
                     if reason == 'track_change' and (not finite(duration) or duration <= 0
                             or event.listened_ms < duration * self.historical_skip_threshold):
                         proven_skip = (event.outcome == 'rejected' and not event.weak

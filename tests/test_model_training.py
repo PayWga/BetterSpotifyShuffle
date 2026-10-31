@@ -51,7 +51,7 @@ def test_metrics_use_target_rank_not_its_position_in_candidates():
     assert metrics['hit_at_k']==1
     assert metrics['ndcg_at_k']==pytest.approx(1/math.log2(3))
     assert metrics['mean_candidates']==3
-    assert model.training  # evaluation must restore prior state
+    assert model.training  # Evaluation restores the previous training mode.
 
 
 def test_training_and_preference_phase_use_training_only_and_roundtrip_checkpoint(tmp_path):
